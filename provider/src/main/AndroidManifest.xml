@@ -8,7 +8,6 @@
     </queries>
 
     <uses-permission android:name="com.hamondev.shevery.permission.PRIVILEGED_API" />
-    <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
 
     <application tools:ignore="AllowBackup,GoogleAppIndexingWarning">
         <meta-data
