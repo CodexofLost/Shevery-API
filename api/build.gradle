@@ -1,19 +1,32 @@
 plugins {
-    id 'com.android.library'
+    id('com.android.library')
 }
 
 android {
-    namespace 'com.hamondev.shevery.api'
-    compileSdk = 37
-    defaultConfig {
-        minSdk = 24
-        consumerProguardFiles 'consumer-rules.pro'
-    }
+    namespace 'rikka.shizuku.api'
     buildFeatures {
-        buildConfig = false
+        buildConfig false
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
     }
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_11
-        targetCompatibility = JavaVersion.VERSION_11
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
     }
+}
+
+dependencies {
+    api project(':aidl')
+    api project(':shared')
+
+    implementation 'androidx.annotation:annotation:1.11.0-alpha01'
+}
+
+ext {
+    publishLibrary = true
+    POM_NAME = "Shizuku API - API"
+    POM_DESCRIPTION = "API of Shizuku and Sui."
 }
