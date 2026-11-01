@@ -19,8 +19,8 @@
 
 ```groovy
 dependencies {
-    implementation "com.hamondev.shevery.api:api:14.5.0"
-    implementation "com.hamondev.shevery.api:provider:14.5.0"
+    implementation "com.hamondev.shevery.api:api:14.6.0"
+    implementation "com.hamondev.shevery.api:provider:14.6.0"
 }
 ```
 
