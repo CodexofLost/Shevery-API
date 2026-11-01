@@ -16,6 +16,8 @@ import androidx.annotation.Nullable;
 import java.io.File;
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 import moe.shizuku.server.IRemoteProcess;
 import moe.shizuku.server.IShizukuApplication;
@@ -303,15 +305,139 @@ public abstract class Service<
         return entry != null && entry.isDenied();
     }
 
+    private static final String DEFAULT_PATH = "/data/local/tmp/shevery/bin:/product/bin:/apex/com.android.runtime/bin:/apex/com.android.art/bin:/system_ext/bin:/system/bin:/system/xbin:/odm/bin:/vendor/bin:/vendor/xbin:/sbin:/data/adb/apatch:/data/adb/ksu/bin";
+
+    private String[] translateAdbCommand(String[] cmd) {
+        if (cmd == null || cmd.length == 0) {
+            return cmd;
+        }
+
+        String program = cmd[0];
+        if (!"adb".equals(program) && !program.endsWith("/adb")) {
+            return cmd;
+        }
+
+        int index = 1;
+        while (index < cmd.length) {
+            String arg = cmd[index];
+            if ("-s".equals(arg) || "-H".equals(arg) || "-P".equals(arg) || "-L".equals(arg)) {
+                index += 2;
+            } else if ("-d".equals(arg) || "-e".equals(arg)) {
+                index += 1;
+            } else {
+                break;
+            }
+        }
+
+        if (index >= cmd.length) {
+            return new String[]{"/system/bin/sh"};
+        }
+
+        String sub = cmd[index];
+        if ("shell".equals(sub)) {
+            index++;
+            if (index >= cmd.length) {
+                return new String[]{"/system/bin/sh"};
+            }
+            StringBuilder sb = new StringBuilder();
+            for (int i = index; i < cmd.length; i++) {
+                if (i > index) sb.append(' ');
+                sb.append(cmd[i]);
+            }
+            return new String[]{"/system/bin/sh", "-c", sb.toString()};
+        } else if ("devices".equals(sub)) {
+            return new String[]{"/system/bin/sh", "-c", "echo 'List of devices attached\nshevery-device\tdevice'"};
+        } else if ("version".equals(sub)) {
+            return new String[]{"/system/bin/sh", "-c", "echo 'Android Debug Bridge version 1.0.41\nVersion shevery-server'"};
+        } else if ("get-state".equals(sub) || "get-serialno".equals(sub)) {
+            return new String[]{"/system/bin/sh", "-c", "echo 'shevery-device'"};
+        } else if ("wait-for-device".equals(sub)) {
+            return new String[]{"/system/bin/sh", "-c", "exit 0"};
+        } else if ("install".equals(sub)) {
+            StringBuilder sb = new StringBuilder("pm install");
+            for (int i = index + 1; i < cmd.length; i++) {
+                sb.append(' ').append(cmd[i]);
+            }
+            return new String[]{"/system/bin/sh", "-c", sb.toString()};
+        } else if ("uninstall".equals(sub)) {
+            StringBuilder sb = new StringBuilder("pm uninstall");
+            for (int i = index + 1; i < cmd.length; i++) {
+                sb.append(' ').append(cmd[i]);
+            }
+            return new String[]{"/system/bin/sh", "-c", sb.toString()};
+        } else if ("push".equals(sub) || "pull".equals(sub)) {
+            StringBuilder sb = new StringBuilder("cp -r");
+            for (int i = index + 1; i < cmd.length; i++) {
+                sb.append(' ').append(cmd[i]);
+            }
+            return new String[]{"/system/bin/sh", "-c", sb.toString()};
+        } else {
+            StringBuilder sb = new StringBuilder();
+            for (int i = index; i < cmd.length; i++) {
+                if (i > index) sb.append(' ');
+                sb.append(cmd[i]);
+            }
+            return new String[]{"/system/bin/sh", "-c", sb.toString()};
+        }
+    }
+
+    private String[] sanitizeEnvironment(String[] env) {
+        Map<String, String> map = new LinkedHashMap<>();
+        if (env == null) {
+            map.putAll(System.getenv());
+        } else {
+            for (String entry : env) {
+                if (entry == null) continue;
+                int eq = entry.indexOf('=');
+                if (eq > 0) {
+                    map.put(entry.substring(0, eq), entry.substring(eq + 1));
+                }
+            }
+        }
+        String path = map.get("PATH");
+        if (path == null || path.isEmpty()) {
+            map.put("PATH", DEFAULT_PATH);
+        } else if (!path.contains("/data/local/tmp/shevery/bin")) {
+            map.put("PATH", "/data/local/tmp/shevery/bin:" + path);
+        }
+        if (!map.containsKey("AXERON")) {
+            map.put("AXERON", "true");
+        }
+        if (!map.containsKey("AXERONVER")) {
+            map.put("AXERONVER", "1.0.0");
+        }
+        if (!map.containsKey("ASH_STANDALONE")) {
+            map.put("ASH_STANDALONE", "1");
+        }
+        String[] result = new String[map.size()];
+        int i = 0;
+        for (Map.Entry<String, String> e : map.entrySet()) {
+            result[i++] = e.getKey() + "=" + e.getValue();
+        }
+        return result;
+    }
+
     @Override
     public final IRemoteProcess newProcess(String[] cmd, String[] env, String dir) {
         enforceCallingPermission("newProcess");
 
-        LOGGER.d("newProcess: uid=%d, cmd=%s, env=%s, dir=%s", Binder.getCallingUid(), Arrays.toString(cmd), Arrays.toString(env), dir);
+        String[] finalCmd = translateAdbCommand(cmd);
+        String[] finalEnv = sanitizeEnvironment(env);
+        File workingDir = null;
+        if (dir != null) {
+            File d = new File(dir);
+            if (d.isDirectory() && d.canRead() && d.canExecute()) {
+                workingDir = d;
+            } else {
+                workingDir = new File("/data/local/tmp");
+            }
+        }
+
+        LOGGER.d("newProcess: uid=%d, cmd=%s, env=%s, dir=%s", Binder.getCallingUid(), Arrays.toString(finalCmd), Arrays.toString(finalEnv), workingDir);
 
         java.lang.Process process;
         try {
-            process = Runtime.getRuntime().exec(cmd, env, dir != null ? new File(dir) : null);
+            process = Runtime.getRuntime().exec(finalCmd, finalEnv, workingDir);
         } catch (IOException e) {
             throw new IllegalStateException(e.getMessage());
         }
