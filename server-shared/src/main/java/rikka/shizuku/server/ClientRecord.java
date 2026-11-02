@@ -15,7 +15,7 @@ public class ClientRecord {
 
     public final int uid;
     public final int pid;
-    public final IShizukuApplication client;
+    public volatile IShizukuApplication client;
     public final String packageName;
     public final int apiVersion;
     public volatile boolean allowed;

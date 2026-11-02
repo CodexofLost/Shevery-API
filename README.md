@@ -44,8 +44,7 @@ dependencies {
         android:authorities="${applicationId}.shevery"
         android:multiprocess="false"
         android:enabled="true"
-        android:exported="true"
-        android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+        android:exported="true" />
 </application>
 ```
 
