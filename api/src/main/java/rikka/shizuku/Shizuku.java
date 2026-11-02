@@ -458,6 +458,12 @@ public class Shizuku {
     @NonNull
     protected static IShizukuService requireService() {
         if (service == null) {
+            IBinder fallback = com.hamondev.shevery.api.SheveryPrivilege.getBinder();
+            if (fallback != null && fallback.pingBinder()) {
+                binder = fallback;
+                service = IShizukuService.Stub.asInterface(fallback);
+                return service;
+            }
             throw new IllegalStateException("binder haven't been received");
         }
         return service;
@@ -470,7 +476,10 @@ public class Shizuku {
      */
     @Nullable
     public static IBinder getBinder() {
-        return binder;
+        if (binder != null) {
+            return binder;
+        }
+        return com.hamondev.shevery.api.SheveryPrivilege.getBinder();
     }
 
     /**
@@ -484,7 +493,10 @@ public class Shizuku {
      */
     public static boolean pingBinder() {
         IBinder b = binder;
-        return b != null && b.pingBinder();
+        if (b != null && b.pingBinder()) {
+            return true;
+        }
+        return com.hamondev.shevery.api.SheveryPrivilege.pingBinder();
     }
 
     private static RuntimeException rethrowAsRuntimeException(RemoteException e) {
@@ -536,6 +548,11 @@ public class Shizuku {
      */
     public static int getUid() {
         if (serverUid != -1) return serverUid;
+        int sheveryUid = com.hamondev.shevery.api.SheveryPrivilege.getUid();
+        if (sheveryUid != -1) {
+            serverUid = sheveryUid;
+            return serverUid;
+        }
         try {
             serverUid = requireService().getUid();
         } catch (RemoteException e) {
@@ -554,6 +571,11 @@ public class Shizuku {
      */
     public static int getVersion() {
         if (serverApiVersion != -1) return serverApiVersion;
+        int sheveryVersion = com.hamondev.shevery.api.SheveryPrivilege.getVersion();
+        if (sheveryVersion != -1) {
+            serverApiVersion = sheveryVersion;
+            return serverApiVersion;
+        }
         try {
             serverApiVersion = requireService().getVersion();
         } catch (RemoteException e) {
@@ -597,6 +619,11 @@ public class Shizuku {
      */
     public static String getSELinuxContext() {
         if (serverContext != null) return serverContext;
+        String sheveryContext = com.hamondev.shevery.api.SheveryPrivilege.getSELinuxContext();
+        if (sheveryContext != null) {
+            serverContext = sheveryContext;
+            return serverContext;
+        }
         try {
             serverContext = requireService().getSELinuxContext();
         } catch (RemoteException e) {
