@@ -12,6 +12,18 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * Client-side PTY terminal relay for {@code rish}.
+ * <p>
+ * Incorporates fixes from Nightzuku API ({@code RishTerminal.kt}) and Porter API ({@code PorshTerminal.kt}):
+ * <ul>
+ *     <li>Fixes {@code stderr} descriptor routing bug (passing {@code getFd(stderr, 0)} instead of {@code getFd(stdout, 0)}).</li>
+ *     <li>Applies {@link #routable(byte)} so piped {@code stdout} forces {@code stderr} onto a pipe as well.</li>
+ *     <li>Passes a non-null {@code reply} Parcel in {@link #setWindowSize(long)} before {@code readException()}.</li>
+ *     <li>Uses a daemon thread for {@code SIGWINCH} window-size forwarding and breaks on exception.</li>
+ *     <li>Closes local pipe descriptors in {@code finally} when {@link #waitFor()} completes.</li>
+ * </ul>
+ */
 public class RishTerminal {
 
     private static final String TAG = "RishTerminal";
@@ -30,17 +42,28 @@ public class RishTerminal {
         FileDescriptors.closeSilently(fileDescriptor[i]);
     }
 
+    /**
+     * When stdout is piped (`rish -c cmd | grep x`), stderr must also travel over a pipe
+     * rather than an unread PTY. Adapted from Porter API ({@code PorshTerminal.routable}).
+     */
+    static byte routable(byte tty) {
+        if ((tty & RishConstants.ATTY_OUT) != 0) {
+            return tty;
+        }
+        return (byte) (tty & ~RishConstants.ATTY_ERR);
+    }
+
     private final String[] argv;
     private final byte tty;
     private FileDescriptor[] stdin;
     private FileDescriptor[] stdout;
     private FileDescriptor[] stderr;
-    private int ttyFd = -1;
-    private int exitCode;
+    private volatile int ttyFd = -1;
+    private volatile int exitCode;
 
     public RishTerminal(String[] argv) throws ErrnoException, RemoteException {
         this.argv = argv;
-        this.tty = prepare();
+        this.tty = routable(prepare());
 
         createHost();
     }
@@ -87,10 +110,10 @@ public class RishTerminal {
     public void start() {
         Log.d(TAG, "start");
 
-        ttyFd = start(tty, getFd(stdin, 1), getFd(stdout, 0), getFd(stdout, 0));
+        ttyFd = start(tty, getFd(stdin, 1), getFd(stdout, 0), getFd(stderr, 0));
 
         if (ttyFd != -1) {
-            new Thread(() -> {
+            Thread winThread = new Thread(() -> {
                 while (true) {
                     Log.d(TAG, "waitForWindowSizeChange");
 
@@ -99,9 +122,12 @@ public class RishTerminal {
                         setWindowSize(size);
                     } catch (Throwable e) {
                         Log.w(TAG, Log.getStackTraceString(e));
+                        break;
                     }
                 }
-            }).start();
+            }, "rish-winch");
+            winThread.setDaemon(true);
+            winThread.start();
         }
     }
 
@@ -114,7 +140,7 @@ public class RishTerminal {
         try {
             data.writeInterfaceToken(RishConfig.getInterfaceToken());
             data.writeLong(size);
-            RishConfig.getBinder().transact(RishConfig.getTransactionCode(RishConfig.TRANSACTION_setWindowSize), data, null, 0);
+            RishConfig.getBinder().transact(RishConfig.getTransactionCode(RishConfig.TRANSACTION_setWindowSize), data, reply, 0);
             reply.readException();
         } finally {
             data.recycle();
@@ -130,7 +156,7 @@ public class RishTerminal {
 
         try {
             data.writeInterfaceToken(RishConfig.getInterfaceToken());
-            RishConfig.getBinder().transact(RishConfig.getTransactionCode(RishConfig.TRANSACTION_getExitCode), data, null, 0);
+            RishConfig.getBinder().transact(RishConfig.getTransactionCode(RishConfig.TRANSACTION_getExitCode), data, reply, 0);
             reply.readException();
             return reply.readInt();
         } finally {
@@ -148,6 +174,10 @@ public class RishTerminal {
         } catch (Throwable e) {
             Log.w(TAG, Log.getStackTraceString(e));
             exitCode = -1;
+        } finally {
+            closeFd(stdin, 1);
+            closeFd(stdout, 0);
+            closeFd(stderr, 0);
         }
         return exitCode;
     }

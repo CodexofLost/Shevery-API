@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <android/log.h>
 #include <pthread.h>
+#include <memory>
+#include <atomic>
 #include "logging.h"
 #include "pts.h"
 
@@ -71,9 +73,11 @@ static jint RishTerminal_start(
         PLOGE("pthread_mutex_lock");
     }
 
-    auto called = std::make_shared<std::atomic_bool>(false);
-    auto func = [=]() {
-        if (called->exchange(true)) {
+    // Wait for both stdout and stderr (when piped) to finish draining before unlocking mutex.
+    // Adapted from Porter API (porsh_terminal.cpp).
+    auto pending = std::make_shared<std::atomic_int>(err_tty ? 1 : 2);
+    auto func = [=](bool) {
+        if (pending->fetch_sub(1) != 1) {
             return;
         }
 
@@ -90,10 +94,10 @@ static jint RishTerminal_start(
         }
     };
 
-    transfer_async(STDIN_FILENO, stdin_pipe/*, func*/);
+    transfer_async(STDIN_FILENO, stdin_pipe);
     transfer_async(stdout_pipe, STDOUT_FILENO, func);
     if (!err_tty) {
-        transfer_async(stderr_pipe, STDERR_FILENO/*, func*/);
+        transfer_async(stderr_pipe, STDERR_FILENO, func);
     }
 
     auto sigwinch_handler = [](int sig) {

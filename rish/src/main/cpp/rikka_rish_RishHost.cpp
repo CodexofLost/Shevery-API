@@ -6,6 +6,8 @@
 #include <wait.h>
 #include <android/log.h>
 #include <pthread.h>
+#include <memory>
+#include <atomic>
 #include "logging.h"
 #include "pts.h"
 
@@ -21,8 +23,6 @@ static int setWindowSize(int ptmx, jlong size) {
     }
     return 0;
 }
-
-// libcore/ojluni/src/main/native/UNIXProcess_md.c
 
 static void *xmalloc(JNIEnv *env, size_t size) {
     void *p = malloc(size);
@@ -48,11 +48,19 @@ static void initVectorFromBlock(const char **vector, const char *block, int coun
     int i;
     const char *p;
     for (i = 0, p = block; i < count; i++) {
-        /* Invariant: p always points to the start of a C string. */
         vector[i] = p;
         while (*(p++));
     }
     vector[count] = nullptr;
+}
+
+// Adapted from Porter API (porsh_host.cpp):
+// Signals process group (-pid) and unreaped child (pid) safely using waitid(..., WNOWAIT).
+static void kill_child(pid_t pid) {
+    siginfo_t info{};
+    bool unreaped = waitid(P_PID, pid, &info, WEXITED | WNOHANG | WNOWAIT) == 0;
+    kill(-pid, SIGKILL);
+    if (unreaped) kill(pid, SIGKILL);
 }
 
 static jintArray RishHost_startHost(
@@ -130,31 +138,71 @@ static jintArray RishHost_startHost(
         releaseBytes(env, dirBlock, pdir);
 
         auto called = std::make_shared<std::atomic_bool>(false);
-        auto func = [pid, called]() {
-            if (called->exchange(true)) {
+        auto func = [pid, called](bool failed) {
+            if (!failed || called->exchange(true)) {
                 return;
             }
 
             LOGW("client dead, kill forked process");
-            kill(pid, SIGKILL);
+            kill_child(pid);
+        };
+
+        if (!in_tty) fcntl(stdin_pipe[1], F_SETFD, FD_CLOEXEC);
+        if (!out_tty) fcntl(stdout_pipe[0], F_SETFD, FD_CLOEXEC);
+        if (!err_tty) fcntl(stderr_pipe[0], F_SETFD, FD_CLOEXEC);
+
+        auto pty = [ptmx, pid]() {
+            int fd = fcntl(ptmx, F_DUPFD_CLOEXEC, 0);
+            if (fd == -1) {
+                PLOGE("dup ptmx");
+                kill_child(pid);
+            }
+            return fd;
         };
 
         if (in_tty) {
-            transfer_async(stdin_read, ptmx/*, func*/);
+            int fd = pty();
+            if (fd != -1) {
+                transfer_async(stdin_read, fd);
+            } else {
+                close(stdin_read);
+            }
         } else {
-            transfer_async(stdin_read, stdin_pipe[1]/*, func*/);
+            transfer_async(stdin_read, stdin_pipe[1]);
             close(stdin_pipe[0]);
         }
 
         if (out_tty) {
-            transfer_async(ptmx, stdout_write, func);
+            int fd = pty();
+            if (fd != -1) {
+                transfer_async(fd, stdout_write, func, true, true, true);
+            } else {
+                close(stdout_write);
+            }
         } else {
-            transfer_async(stdout_pipe[0], stdout_write, func);
+            transfer_async(stdout_pipe[0], stdout_write, func, true, true, true);
             close(stdout_pipe[1]);
+
+            if (in_tty || err_tty) {
+                int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+                if (null_fd == -1) {
+                    PLOGE("open /dev/null");
+                    kill_child(pid);
+                } else {
+                    int fd = pty();
+                    if (fd != -1) {
+                        transfer_async(fd, null_fd, [pid, called](bool failed) {
+                            if (failed && !called->exchange(true)) kill_child(pid);
+                        });
+                    } else {
+                        close(null_fd);
+                    }
+                }
+            }
         }
 
         if (!err_tty) {
-            transfer_async(stderr_pipe[0], stderr_write/*, func*/);
+            transfer_async(stderr_pipe[0], stderr_write);
             close(stderr_pipe[1]);
         }
 
@@ -242,7 +290,7 @@ static jintArray RishHost_startHost(
                 exit(1);
             }
         }
-        exit(0);
+        return nullptr;
     }
 }
 
@@ -251,30 +299,16 @@ static void RishHost_setWindowSize(JNIEnv *env, jclass clazz, jint ptmx, jlong s
 }
 
 static jint RishHost_waitFor(JNIEnv *env, jclass clazz, jint pid) {
-    if (pid < 0)
-        return -1;
+    LOGD("waitFor %d", pid);
 
     int status;
-    int w;
-    do {
-        w = TEMP_FAILURE_RETRY(waitpid(pid, &status, 0));
-        if (w == -1) {
-            if (errno == ECHILD) {
-                return 0;
-            }
-            PLOGE("waitpid");
-            return -1;
-        }
+    if (waitpid(pid, &status, 0) == -1) {
+        PLOGE("waitpid");
+        return -1;
+    }
 
-        if (WIFEXITED(status)) {
-            LOGD("exited with %d", WEXITSTATUS(status));
-            return WEXITSTATUS(status);
-        } else if (WIFSIGNALED(status)) {
-            LOGD("killed by signal %d", WTERMSIG(status));
-            return 0;
-        }
-    } while (!WIFEXITED(status) && !WIFSIGNALED(status));
-
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
     return -1;
 }
 

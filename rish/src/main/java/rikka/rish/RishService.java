@@ -4,22 +4,48 @@ import android.os.Binder;
 import android.os.IBinder;
 import android.os.Parcel;
 import android.os.ParcelFileDescriptor;
+import android.os.SystemClock;
 import android.system.Os;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
-import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
+/**
+ * Server-side Binder dispatcher for {@code rish} interactive PTY sessions.
+ * <p>
+ * Incorporates thread-safe {@link ConcurrentHashMap} host registry, null-safe {@code env}
+ * resolution, bounded exit-code collection, and automatic reaping of uncollected exited
+ * hosts from Nightzuku API ({@code RishService.kt}) and Porter API ({@code PorshHostRegistry.kt}).
+ */
 public abstract class RishService {
 
     private static final String TAG = "RishService";
+    private static final long EXIT_CODE_TIMEOUT_MILLIS = 5_000L;
+    private static final long UNCOLLECTED_MAX_AGE_MILLIS = 60_000L;
 
-    private static final Map<Integer, RishHost> HOSTS = new HashMap<>();
+    private static final Map<Integer, RishHost> HOSTS = new ConcurrentHashMap<>();
 
     private static final boolean IS_ROOT = Os.getuid() == 0;
+
+    private void reapUncollected() {
+        long now = SystemClock.elapsedRealtime();
+        for (Map.Entry<Integer, RishHost> entry : HOSTS.entrySet()) {
+            RishHost host = entry.getValue();
+            if (!host.hasExited()) {
+                continue;
+            }
+            if (now - host.getExitedAtMillis() <= UNCOLLECTED_MAX_AGE_MILLIS) {
+                continue;
+            }
+            if (HOSTS.remove(entry.getKey(), host)) {
+                Log.d(TAG, "Reaped uncollected host of " + entry.getKey());
+            }
+        }
+    }
 
     private void createHost(
             String[] args, String[] env, String dir,
@@ -27,21 +53,20 @@ public abstract class RishService {
             ParcelFileDescriptor stdin, ParcelFileDescriptor stdout, ParcelFileDescriptor stderr) {
 
         int callingPid = Binder.getCallingPid();
-
-        // Termux app set PATH and LD_PRELOAD to Termux's internal path.
-        // Adb does not have sufficient permissions to access such places.
+        reapUncollected();
 
         // Under adb, users need to set RISH_PRESERVE_ENV=1 to preserve env.
         // Under root, keep env unless RISH_PRESERVE_ENV=0 is set.
-
         boolean allowEnv = IS_ROOT;
-        for (String e : env) {
-            if ("RISH_PRESERVE_ENV=1".equals(e)) {
-                allowEnv = true;
-                break;
-            } else if ("RISH_PRESERVE_ENV=0".equals(e)) {
-                allowEnv = false;
-                break;
+        if (env != null) {
+            for (String e : env) {
+                if ("RISH_PRESERVE_ENV=1".equals(e)) {
+                    allowEnv = true;
+                    break;
+                } else if ("RISH_PRESERVE_ENV=0".equals(e)) {
+                    allowEnv = false;
+                    break;
+                }
             }
         }
         if (!allowEnv) {
@@ -76,6 +101,11 @@ public abstract class RishService {
             return -1;
         }
 
+        int code = host.awaitExitCode(EXIT_CODE_TIMEOUT_MILLIS);
+        if (!host.hasExited()) {
+            return code;
+        }
+        HOSTS.remove(callingPid, host);
         return host.getExitCode();
     }
 
@@ -135,5 +165,4 @@ public abstract class RishService {
         }
         return false;
     }
-
 }
