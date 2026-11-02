@@ -85,8 +85,12 @@ public class SheveryProvider extends ContentProvider {
     private static IBinder callOwnProvider(@NonNull Context context) {
         final String pkg = context.getPackageName();
         final String authority = pkg + SheveryApiConstants.PROVIDER_SUFFIX;
-        ProviderInfo providerInfo = context.getPackageManager().resolveContentProvider(authority, 0);
-        if (providerInfo == null || !pkg.equals(providerInfo.packageName)) {
+        ProviderInfo providerInfo = null;
+        try {
+            providerInfo = context.getPackageManager().resolveContentProvider(authority, 0);
+        } catch (Throwable ignored) {
+        }
+        if (providerInfo != null && !pkg.equals(providerInfo.packageName)) {
             return null;
         }
 
@@ -104,6 +108,9 @@ public class SheveryProvider extends ContentProvider {
             if (extracted == null) {
                 reply.setClassLoader(BinderContainer.class.getClassLoader());
                 BinderContainer container = reply.getParcelable(SheveryApiConstants.EXTRA_BINDER);
+                if (container == null) {
+                    container = reply.getParcelable(SheveryApiConstants.LEGACY_EXTRA_BINDER);
+                }
                 if (container != null) {
                     extracted = container.binder;
                 }

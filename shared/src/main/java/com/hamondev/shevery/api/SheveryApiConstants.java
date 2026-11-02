@@ -75,8 +75,10 @@ public final class SheveryApiConstants {
     public static final String EXTRA_REQUESTED_PERMISSION = "com.hamondev.shevery.intent.extra.REQUESTED_PERMISSION";
 
     public static final String ACTION_BINDER_RECEIVED = "com.hamondev.shevery.api.action.BINDER_RECEIVED";
+    public static final String LEGACY_ACTION_BINDER_RECEIVED = "moe.shizuku.api.action.BINDER_RECEIVED";
     public static final String ACTION_REQUEST_PERMISSION = "com.hamondev.shevery.intent.action.REQUEST_PERMISSION";
     public static final String ACTION_REQUEST_BINDER = "com.hamondev.shevery.intent.action.REQUEST_BINDER";
+    public static final String LEGACY_ACTION_REQUEST_BINDER = "rikka.shizuku.intent.action.REQUEST_BINDER";
 
     // Attach application channel & capability negotiation
     public static final String ATTACH_APPLICATION_CLIENT_CHANNEL = "shevery:attach-client-channel";
