@@ -7,19 +7,26 @@ import android.text.TextUtils;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
-import java.util.HashMap;
 import java.util.Map;
-import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 
+/**
+ * Thread-safe system service binder and transaction code lookup helper.
+ * <p>
+ * Incorporates {@link ConcurrentHashMap} caching, {@link IBinder#pingBinder()} liveness
+ * validation, and {@link #clearCache()} from Nightzuku API ({@code SystemServiceHelper.kt}).
+ */
 @SuppressLint("PrivateApi")
 public class SystemServiceHelper {
 
-    private static final Map<String, IBinder> SYSTEM_SERVICE_CACHE = new HashMap<>();
-    private static final Map<String, Integer> TRANSACT_CODE_CACHE = new HashMap<>();
+    private static final String TAG = "SystemServiceHelper";
+    private static final Map<String, IBinder> SYSTEM_SERVICE_CACHE = new ConcurrentHashMap<>();
+    private static final Map<String, Integer> TRANSACT_CODE_CACHE = new ConcurrentHashMap<>();
 
     private static Method getService;
 
@@ -28,27 +35,40 @@ public class SystemServiceHelper {
             Class<?> sm = Class.forName("android.os.ServiceManager");
             getService = sm.getMethod("getService", String.class);
         } catch (ClassNotFoundException | NoSuchMethodException e) {
-            Log.w("SystemServiceHelper", Log.getStackTraceString(e));
+            Log.w(TAG, Log.getStackTraceString(e));
         }
     }
 
     /**
-     * Returns a reference to a service with the given name.
+     * Returns a reference to a service with the given name, verifying that any cached
+     * binder is still alive via {@link IBinder#pingBinder()}.
      *
      * @param name the name of the service to get such as "package" for android.content.pm.IPackageManager
-     * @return a reference to the service, or <code>null</code> if the service doesn't exist
+     * @return a reference to the service, or {@code null} if the service doesn't exist
      */
+    @Nullable
     public static IBinder getSystemService(@NonNull String name) {
         IBinder binder = SYSTEM_SERVICE_CACHE.get(name);
-        if (binder == null) {
+        if (binder == null || !binder.pingBinder()) {
             try {
-                binder = (IBinder) getService.invoke(null, name);
+                binder = getService != null ? (IBinder) getService.invoke(null, name) : null;
             } catch (IllegalAccessException | InvocationTargetException e) {
-                Log.w("SystemServiceHelper", Log.getStackTraceString(e));
+                Log.w(TAG, Log.getStackTraceString(e));
             }
-            SYSTEM_SERVICE_CACHE.put(name, binder);
+            if (binder != null) {
+                SYSTEM_SERVICE_CACHE.put(name, binder);
+            } else {
+                SYSTEM_SERVICE_CACHE.remove(name);
+            }
         }
         return binder;
+    }
+
+    /**
+     * Clears cached system service binders.
+     */
+    public static void clearCache() {
+        SYSTEM_SERVICE_CACHE.clear();
     }
 
     /**
@@ -56,10 +76,11 @@ public class SystemServiceHelper {
      *
      * @param className  class name such as "android.content.pm.IPackageManager$Stub"
      * @param methodName method name such as "getInstalledPackages"
-     * @return transaction code, or <code>null</code> if the class or the method doesn't exist
+     * @return transaction code, or {@code null} if the class or the method doesn't exist
      * @deprecated Use {@link ShizukuBinderWrapper} instead
      */
     @Deprecated
+    @Nullable
     public static Integer getTransactionCode(@NonNull String className, @NonNull String methodName) {
         final String fieldName = "TRANSACTION_" + methodName;
         final String key = className + "." + fieldName;
@@ -95,37 +116,16 @@ public class SystemServiceHelper {
             TRANSACT_CODE_CACHE.put(key, value);
             return value;
         } catch (ClassNotFoundException | IllegalAccessException e) {
-            e.printStackTrace();
+            Log.w(TAG, Log.getStackTraceString(e));
         }
         return null;
     }
 
-    /**
-     * Obtain a new data parcel for {@link Shizuku#transactRemote(Parcel, Parcel, int)}.
-     *
-     * @param serviceName   system service name
-     * @param interfaceName class name for reflection
-     * @param methodName    method name for reflection
-     * @return data parcel
-     * @throws NullPointerException can't get system service or transaction code
-     * @deprecated Use {@link ShizukuBinderWrapper} instead
-     */
     @Deprecated
     public static Parcel obtainParcel(@NonNull String serviceName, @NonNull String interfaceName, @NonNull String methodName) {
         return obtainParcel(serviceName, interfaceName, interfaceName + "$Stub", methodName);
     }
 
-    /**
-     * Obtain a new data parcel for {@link Shizuku#transactRemote(Parcel, Parcel, int)}.
-     *
-     * @param serviceName   system service name
-     * @param interfaceName interface name
-     * @param className     class name for reflection
-     * @param methodName    method name for reflection
-     * @return data parcel
-     * @throws NullPointerException can't get system service or transaction code
-     * @deprecated Use {@link ShizukuBinderWrapper} instead
-     */
     @Deprecated
     public static Parcel obtainParcel(@NonNull String serviceName, @NonNull String interfaceName, @NonNull String className, @NonNull String methodName) {
         throw new UnsupportedOperationException("Direct use of Shizuku#transactRemote is no longer supported, please use ShizukuBinderWrapper");

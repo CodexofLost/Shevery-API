@@ -16,15 +16,35 @@ public class ShizukuSystemProperties {
     }
 
     public static int getInt(String key, int def) throws RemoteException {
-        return Integer.decode(Shizuku.requireService().getSystemProperty(key, Integer.toString(def)));
+        String raw = Shizuku.requireService().getSystemProperty(key, Integer.toString(def));
+        if (raw == null || raw.isEmpty()) {
+            return def;
+        }
+        try {
+            return Integer.decode(raw);
+        } catch (NumberFormatException ignored) {
+            return def;
+        }
     }
 
     public static long getLong(String key, long def) throws RemoteException {
-        return Long.decode(Shizuku.requireService().getSystemProperty(key, Long.toString(def)));
+        String raw = Shizuku.requireService().getSystemProperty(key, Long.toString(def));
+        if (raw == null || raw.isEmpty()) {
+            return def;
+        }
+        try {
+            return Long.decode(raw);
+        } catch (NumberFormatException ignored) {
+            return def;
+        }
     }
 
     public static boolean getBoolean(String key, boolean def) throws RemoteException {
-        return Boolean.parseBoolean(Shizuku.requireService().getSystemProperty(key, Boolean.toString(def)));
+        String raw = Shizuku.requireService().getSystemProperty(key, Boolean.toString(def));
+        if (raw == null || raw.isEmpty()) {
+            return def;
+        }
+        return Boolean.parseBoolean(raw);
     }
 
     public static void set(String key, String val) throws RemoteException {

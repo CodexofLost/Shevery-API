@@ -20,8 +20,9 @@ final class SheveryServiceConnection extends IShizukuServiceConnection.Stub {
 
     private final Set<ServiceConnection> connections = new CopyOnWriteArraySet<>();
     private final ComponentName componentName;
-    private IBinder binder;
-    private boolean dead = false;
+    private final IBinder.DeathRecipient deathRecipient = this::died;
+    private volatile IBinder binder;
+    private volatile boolean dead = false;
 
     SheveryServiceConnection(SheveryPrivilege.UserServiceArgs args) {
         this.componentName = args.componentName;
@@ -53,14 +54,24 @@ final class SheveryServiceConnection extends IShizukuServiceConnection.Stub {
 
         this.binder = serviceBinder;
         try {
-            this.binder.linkToDeath(this::died, 0);
+            if (serviceBinder != null) {
+                serviceBinder.linkToDeath(deathRecipient, 0);
+            }
         } catch (RemoteException ignored) {
         }
     }
 
     @Override
     public void died() {
+        IBinder currentBinder = binder;
         binder = null;
+        if (currentBinder != null) {
+            try {
+                currentBinder.unlinkToDeath(deathRecipient, 0);
+            } catch (Throwable ignored) {
+            }
+        }
+
         if (dead) return;
         dead = true;
 

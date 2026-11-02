@@ -17,49 +17,11 @@ import android.util.Log;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
+import com.hamondev.shevery.api.LegacyParcelCodec;
+
 import moe.shizuku.api.BinderContainer;
 import rikka.sui.Sui;
 
-/**
- * <p>
- * This provider receives binder from Shizuku server. When app process starts,
- * Shizuku server (it runs under adb/root) will send the binder to client apps with this provider.
- * </p>
- * <p>
- * Add the provider to your manifest like this:
- * </p>
- * <pre class="prettyprint">&lt;manifest&gt;
- *    ...
- *    &lt;application&gt;
- *        ...
- *        &lt;provider
- *            android:name="rikka.shizuku.ShizukuProvider"
- *            android:authorities="${applicationId}.shizuku"
- *            android:exported="true"
- *            android:multiprocess="false"
- *            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"
- *        &lt;/provider&gt;
- *        ...
- *    &lt;/application&gt;
- * &lt;/manifest&gt;</pre>
- *
- * <p>
- * There are something needs you attention:
- * </p>
- * <ol>
- * <li><code>android:permission</code> shoule be a permission that granted to Shell (com.android.shell)
- * but not normal apps (e.g., android.permission.INTERACT_ACROSS_USERS_FULL), so that it can only
- * be used by the app itself and Shizuku server.</li>
- * <li><code>android:exported</code> must be <code>true</code> so that the provider can be accessed
- * from Shizuku server runs under adb.</li>
- * <li><code>android:multiprocess</code> must be <code>false</code>
- * since Shizuku server only gets uid when app starts.</li>
- * </ol>
- * <p>
- * If your app runs in multiple processes, this provider also provides the functionality of sharing
- * the binder across processes. See {@link #enableMultiProcessSupport(boolean)}.
- * </p>
- */
 public class ShizukuProvider extends ContentProvider {
 
     private static final String TAG = "ShizukuProvider";
@@ -78,21 +40,16 @@ public class ShizukuProvider extends ContentProvider {
 
     public static final String MANAGER_APPLICATION_ID = "moe.shizuku.privileged.api";
 
-    private static boolean enableMultiProcess = false;
+    private static volatile boolean enableMultiProcess = false;
 
-    private static boolean isProviderProcess = false;
+    private static volatile boolean isProviderProcess = false;
 
-    private static boolean enableSuiInitialization = true;
+    private static volatile boolean enableSuiInitialization = true;
 
     public static void setIsProviderProcess(boolean isProviderProcess) {
         ShizukuProvider.isProviderProcess = isProviderProcess;
     }
 
-    /**
-     * Enables built-in multi-process support.
-     * <p>
-     * This method MUST be called as early as possible (e.g., static block in Application).
-     */
     public static void enableMultiProcessSupport(boolean isProviderProcess) {
         Log.d(TAG, "Enable built-in multi-process support (from " + (isProviderProcess ? "provider process" : "non-provider process") + ")");
 
@@ -100,21 +57,13 @@ public class ShizukuProvider extends ContentProvider {
         ShizukuProvider.enableMultiProcess = true;
     }
 
-    /**
-     * Disable automatic Sui initialization.
-     */
     public static void disableAutomaticSuiInitialization() {
         ShizukuProvider.enableSuiInitialization = false;
     }
 
-    private static BroadcastReceiver receiver;
+    private static volatile BroadcastReceiver receiver;
 
-    /**
-     * Require binder for non-provider process, should have {@link #enableMultiProcessSupport(boolean)} called first.
-     *
-     * @param context Context
-     */
-    public static void requestBinderForNonProviderProcess(@NonNull Context context) {
+    public static synchronized void requestBinderForNonProviderProcess(@NonNull Context context) {
         if (isProviderProcess) {
             return;
         }
@@ -125,10 +74,17 @@ public class ShizukuProvider extends ContentProvider {
             receiver = new BroadcastReceiver() {
                 @Override
                 public void onReceive(Context context, Intent intent) {
-                    BinderContainer container = intent.getParcelableExtra(EXTRA_BINDER);
-                    if (container != null && container.binder != null) {
+                    IBinder extracted = LegacyParcelCodec.extractBinderFromBundle(intent.getExtras());
+                    if (extracted == null) {
+                        intent.setExtrasClassLoader(BinderContainer.class.getClassLoader());
+                        BinderContainer container = intent.getParcelableExtra(EXTRA_BINDER);
+                        if (container != null) {
+                            extracted = container.binder;
+                        }
+                    }
+                    if (extracted != null) {
                         Log.i(TAG, "binder received from broadcast");
-                        Shizuku.onBinderReceived(container.binder, context.getPackageName());
+                        Shizuku.onBinderReceived(extracted, context.getPackageName());
                     }
                 }
             };
@@ -149,12 +105,17 @@ public class ShizukuProvider extends ContentProvider {
         }
 
         if (reply != null) {
-            reply.setClassLoader(BinderContainer.class.getClassLoader());
-
-            BinderContainer container = reply.getParcelable(EXTRA_BINDER);
-            if (container != null && container.binder != null) {
+            IBinder extracted = LegacyParcelCodec.extractBinderFromBundle(reply);
+            if (extracted == null) {
+                reply.setClassLoader(BinderContainer.class.getClassLoader());
+                BinderContainer container = reply.getParcelable(EXTRA_BINDER);
+                if (container != null) {
+                    extracted = container.binder;
+                }
+            }
+            if (extracted != null) {
                 Log.i(TAG, "Binder received from other process");
-                Shizuku.onBinderReceived(container.binder, context.getPackageName());
+                Shizuku.onBinderReceived(extracted, context.getPackageName());
             }
         }
     }
@@ -193,8 +154,6 @@ public class ShizukuProvider extends ContentProvider {
             return null;
         }
 
-        extras.setClassLoader(BinderContainer.class.getClassLoader());
-
         Bundle reply = new Bundle();
         switch (method) {
             case METHOD_SEND_BINDER: {
@@ -217,17 +176,24 @@ public class ShizukuProvider extends ContentProvider {
             return;
         }
 
-        BinderContainer container = extras.getParcelable(EXTRA_BINDER);
-        if (container != null && container.binder != null) {
+        IBinder receivedBinder = LegacyParcelCodec.extractBinderFromBundle(extras);
+        if (receivedBinder == null) {
+            extras.setClassLoader(BinderContainer.class.getClassLoader());
+            BinderContainer container = extras.getParcelable(EXTRA_BINDER);
+            if (container != null) {
+                receivedBinder = container.binder;
+            }
+        }
+        if (receivedBinder != null) {
             Log.d(TAG, "binder received");
 
-            Shizuku.onBinderReceived(container.binder, getContext().getPackageName());
+            Shizuku.onBinderReceived(receivedBinder, getContext().getPackageName());
 
             if (enableMultiProcess) {
                 Log.d(TAG, "broadcast binder");
 
                 Intent intent = new Intent(ACTION_BINDER_RECEIVED)
-                        .putExtra(EXTRA_BINDER, container)
+                        .putExtra(EXTRA_BINDER, new BinderContainer(receivedBinder))
                         .setPackage(getContext().getPackageName());
                 getContext().sendBroadcast(intent);
             }
@@ -235,7 +201,6 @@ public class ShizukuProvider extends ContentProvider {
     }
 
     private boolean handleGetBinder(@NonNull Bundle reply) {
-        // Other processes in the same app can read the provider without permission
         IBinder binder = Shizuku.getBinder();
         if (binder == null || !binder.pingBinder())
             return false;
@@ -244,7 +209,6 @@ public class ShizukuProvider extends ContentProvider {
         return true;
     }
 
-    // no other provider methods
     @Nullable
     @Override
     public final Cursor query(@NonNull Uri uri, @Nullable String[] projection, @Nullable String selection, @Nullable String[] selectionArgs, @Nullable String sortOrder) {

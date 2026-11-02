@@ -4,6 +4,9 @@ import android.os.RemoteException;
 
 /**
  * System properties access through the native Shevery Privilege API.
+ * <p>
+ * Includes empty-string and malformed-number fallback handling adapted from
+ * Nightzuku API ({@code NightSystemProperties.kt}).
  */
 public final class SheverySystemProperties {
 
@@ -19,15 +22,35 @@ public final class SheverySystemProperties {
     }
 
     public static int getInt(String key, int def) throws RemoteException {
-        return Integer.decode(SheveryPrivilege.requireService().getSystemProperty(key, Integer.toString(def)));
+        String raw = SheveryPrivilege.requireService().getSystemProperty(key, Integer.toString(def));
+        if (raw == null || raw.isEmpty()) {
+            return def;
+        }
+        try {
+            return Integer.decode(raw);
+        } catch (NumberFormatException ignored) {
+            return def;
+        }
     }
 
     public static long getLong(String key, long def) throws RemoteException {
-        return Long.decode(SheveryPrivilege.requireService().getSystemProperty(key, Long.toString(def)));
+        String raw = SheveryPrivilege.requireService().getSystemProperty(key, Long.toString(def));
+        if (raw == null || raw.isEmpty()) {
+            return def;
+        }
+        try {
+            return Long.decode(raw);
+        } catch (NumberFormatException ignored) {
+            return def;
+        }
     }
 
     public static boolean getBoolean(String key, boolean def) throws RemoteException {
-        return Boolean.parseBoolean(SheveryPrivilege.requireService().getSystemProperty(key, Boolean.toString(def)));
+        String raw = SheveryPrivilege.requireService().getSystemProperty(key, Boolean.toString(def));
+        if (raw == null || raw.isEmpty()) {
+            return def;
+        }
+        return Boolean.parseBoolean(raw);
     }
 
     public static void set(String key, String val) throws RemoteException {

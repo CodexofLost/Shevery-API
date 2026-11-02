@@ -8,6 +8,8 @@ import android.os.RemoteException;
 import android.util.ArraySet;
 import android.util.Log;
 
+import androidx.annotation.NonNull;
+
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.Collections;
@@ -22,7 +24,7 @@ public class ShizukuRemoteProcess extends Process implements Parcelable {
 
     private static final String TAG = "ShizukuRemoteProcess";
 
-    private IRemoteProcess remote;
+    private volatile IRemoteProcess remote;
     private OutputStream os;
     private InputStream is;
     private InputStream err;
@@ -30,7 +32,7 @@ public class ShizukuRemoteProcess extends Process implements Parcelable {
     ShizukuRemoteProcess(IRemoteProcess remote) {
         this.remote = remote;
         try {
-            this.remote.asBinder().linkToDeath((IBinder.DeathRecipient) () -> {
+            this.remote.asBinder().linkToDeath(() -> {
                 this.remote = null;
                 Log.v(TAG, "remote process is dead");
 
@@ -40,15 +42,27 @@ public class ShizukuRemoteProcess extends Process implements Parcelable {
             Log.e(TAG, "linkToDeath", e);
         }
 
-        // The reference to the binder object must be hold
         CACHE.add(this);
     }
 
+    private ShizukuRemoteProcess(Parcel in) {
+        remote = IRemoteProcess.Stub.asInterface(in.readStrongBinder());
+    }
+
+    @NonNull
+    private IRemoteProcess requireRemote() {
+        IRemoteProcess current = remote;
+        if (current == null) {
+            throw new IllegalStateException("Remote process binder is dead");
+        }
+        return current;
+    }
+
     @Override
-    public OutputStream getOutputStream() {
+    public synchronized OutputStream getOutputStream() {
         if (os == null) {
             try {
-                os = new ParcelFileDescriptor.AutoCloseOutputStream(remote.getOutputStream());
+                os = new ParcelFileDescriptor.AutoCloseOutputStream(requireRemote().getOutputStream());
             } catch (RemoteException e) {
                 throw new RuntimeException(e);
             }
@@ -57,10 +71,10 @@ public class ShizukuRemoteProcess extends Process implements Parcelable {
     }
 
     @Override
-    public InputStream getInputStream() {
+    public synchronized InputStream getInputStream() {
         if (is == null) {
             try {
-                is = new ParcelFileDescriptor.AutoCloseInputStream(remote.getInputStream());
+                is = new ParcelFileDescriptor.AutoCloseInputStream(requireRemote().getInputStream());
             } catch (RemoteException e) {
                 throw new RuntimeException(e);
             }
@@ -69,10 +83,10 @@ public class ShizukuRemoteProcess extends Process implements Parcelable {
     }
 
     @Override
-    public InputStream getErrorStream() {
+    public synchronized InputStream getErrorStream() {
         if (err == null) {
             try {
-                err = new ParcelFileDescriptor.AutoCloseInputStream(remote.getErrorStream());
+                err = new ParcelFileDescriptor.AutoCloseInputStream(requireRemote().getErrorStream());
             } catch (RemoteException e) {
                 throw new RuntimeException(e);
             }
@@ -83,7 +97,7 @@ public class ShizukuRemoteProcess extends Process implements Parcelable {
     @Override
     public int waitFor() throws InterruptedException {
         try {
-            return remote.waitFor();
+            return requireRemote().waitFor();
         } catch (RemoteException e) {
             throw new RuntimeException(e);
         }
@@ -92,7 +106,7 @@ public class ShizukuRemoteProcess extends Process implements Parcelable {
     @Override
     public int exitValue() {
         try {
-            return remote.exitValue();
+            return requireRemote().exitValue();
         } catch (RemoteException e) {
             throw new RuntimeException(e);
         }
@@ -101,7 +115,7 @@ public class ShizukuRemoteProcess extends Process implements Parcelable {
     @Override
     public void destroy() {
         try {
-            remote.destroy();
+            requireRemote().destroy();
         } catch (RemoteException e) {
             throw new RuntimeException(e);
         }
@@ -109,7 +123,7 @@ public class ShizukuRemoteProcess extends Process implements Parcelable {
 
     public boolean alive() {
         try {
-            return remote.alive();
+            return requireRemote().alive();
         } catch (RemoteException e) {
             throw new RuntimeException(e);
         }
@@ -117,18 +131,14 @@ public class ShizukuRemoteProcess extends Process implements Parcelable {
 
     public boolean waitForTimeout(long timeout, TimeUnit unit) throws InterruptedException {
         try {
-            return remote.waitForTimeout(timeout, unit.toString());
+            return requireRemote().waitForTimeout(timeout, unit.toString());
         } catch (RemoteException e) {
             throw new RuntimeException(e);
         }
     }
 
     public IBinder asBinder() {
-        return remote.asBinder();
-    }
-
-    private ShizukuRemoteProcess(Parcel in) {
-        remote = IRemoteProcess.Stub.asInterface(in.readStrongBinder());
+        return requireRemote().asBinder();
     }
 
     public static final Creator<ShizukuRemoteProcess> CREATOR = new Creator<ShizukuRemoteProcess>() {
@@ -150,6 +160,7 @@ public class ShizukuRemoteProcess extends Process implements Parcelable {
 
     @Override
     public void writeToParcel(Parcel dest, int flags) {
-        dest.writeStrongBinder(remote.asBinder());
+        IRemoteProcess current = remote;
+        dest.writeStrongBinder(current != null ? current.asBinder() : null);
     }
 }
