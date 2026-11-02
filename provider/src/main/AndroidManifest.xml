@@ -4,8 +4,10 @@
 
     <queries>
         <package android:name="com.hamondev.shevery" />
+        <package android:name="moe.shizuku.privileged.api" />
         <provider android:authorities="com.hamondev.shevery.shevery" />
         <provider android:authorities="com.hamondev.shevery.shizuku" />
+        <provider android:authorities="moe.shizuku.privileged.api.shizuku" />
         <intent>
             <action android:name="com.hamondev.shevery.intent.action.REQUEST_BINDER" />
         </intent>
@@ -17,16 +19,29 @@
     <uses-permission android:name="com.hamondev.shevery.permission.PRIVILEGED_API" />
 
     <application tools:ignore="AllowBackup,GoogleAppIndexingWarning">
-        <!-- Native Shevery Provider (Matches Step 2 in Maintainer's README) -->
+        <!-- Native Shevery Provider -->
         <provider
             android:name="com.hamondev.shevery.api.SheveryProvider"
             android:authorities="${applicationId}.shevery"
             android:enabled="true"
             android:exported="true"
-            android:multiprocess="false" />
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+        <!-- Legacy Shizuku Compat Provider -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:enabled="true"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
 
         <meta-data
             android:name="com.hamondev.shevery.client.PRIVILEGED_API_SUPPORT"
+            android:value="true" />
+        <meta-data
+            android:name="moe.shizuku.client.V3_SUPPORT"
             android:value="true" />
     </application>
 

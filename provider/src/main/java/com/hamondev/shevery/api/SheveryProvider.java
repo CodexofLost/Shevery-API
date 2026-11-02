@@ -18,13 +18,20 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
 import moe.shizuku.api.BinderContainer;
+import moe.shizuku.server.IShizukuService;
+import rikka.shizuku.Shizuku;
 
 /**
  * Native ContentProvider for the Shevery Privilege API ({@code ${applicationId}.shevery}).
  * <p>
- * Supports proactive fast-pull binder acquisition on startup ({@link SheveryPrivilege#connectFast(Context)}),
- * zero-stub {@link LegacyParcelCodec} extraction (adapted from Nightzuku API), and low-latency
- * server push delivery under {@link SheveryApiConstants#PERMISSION_PRIVILEGED_API}.
+ * Incorporates architectural enhancements for zero-stub compatibility:
+ * <ul>
+ *     <li>Proactive fast-pull binder acquisition on startup ({@link SheveryPrivilege#connectFast(Context)}).</li>
+ *     <li>Zero-stub {@link LegacyParcelCodec} extraction across isolated classloaders.</li>
+ *     <li>Low-latency server push delivery under {@link SheveryApiConstants#PERMISSION_PRIVILEGED_API}.</li>
+ *     <li>Synchronous user-service attachment via {@link SheveryApiConstants#METHOD_SEND_USER_SERVICE}.</li>
+ *     <li>Automatic synchronization between {@link SheveryPrivilege} and legacy {@link Shizuku} facades.</li>
+ * </ul>
  */
 public class SheveryProvider extends ContentProvider {
 
@@ -33,6 +40,7 @@ public class SheveryProvider extends ContentProvider {
     public static final String METHOD_SEND_BINDER = SheveryApiConstants.METHOD_SEND_BINDER;
     public static final String METHOD_GET_BINDER = SheveryApiConstants.METHOD_GET_BINDER;
     public static final String METHOD_REQUEST_BINDER = SheveryApiConstants.METHOD_REQUEST_BINDER;
+    public static final String METHOD_SEND_USER_SERVICE = SheveryApiConstants.METHOD_SEND_USER_SERVICE;
     public static final String ACTION_BINDER_RECEIVED = SheveryApiConstants.ACTION_BINDER_RECEIVED;
     public static final String PERMISSION = SheveryApiConstants.PERMISSION_PRIVILEGED_API;
     public static final String MANAGER_APPLICATION_ID = SheveryApiConstants.MANAGER_APPLICATION_ID;
@@ -54,12 +62,10 @@ public class SheveryProvider extends ContentProvider {
             multiProcessReceiver = new BroadcastReceiver() {
                 @Override
                 public void onReceive(Context ctx, Intent intent) {
-                    // The broadcast is only a signal: never trust a binder shipped in its
-                    // extras. Pull it from our own provider after verifying the authority
-                    // still belongs to this application.
+                    // Signal only: pull binder from our own provider
                     IBinder extracted = callOwnProvider(ctx);
                     if (extracted != null) {
-                        SheveryPrivilege.onBinderReceived(extracted, ctx.getPackageName());
+                        dispatchBinderToFacades(extracted, ctx.getPackageName());
                     }
                 }
             };
@@ -77,7 +83,7 @@ public class SheveryProvider extends ContentProvider {
 
         IBinder extracted = callOwnProvider(context);
         if (extracted != null) {
-            SheveryPrivilege.onBinderReceived(extracted, context.getPackageName());
+            dispatchBinderToFacades(extracted, context.getPackageName());
         }
     }
 
@@ -118,6 +124,14 @@ public class SheveryProvider extends ContentProvider {
             return extracted;
         } catch (Throwable ignored) {
             return null;
+        }
+    }
+
+    private static void dispatchBinderToFacades(@NonNull IBinder binder, @NonNull String packageName) {
+        SheveryPrivilege.onBinderReceived(binder, packageName);
+        try {
+            Shizuku.onBinderReceived(binder, packageName);
+        } catch (Throwable ignored) {
         }
     }
 
@@ -165,6 +179,9 @@ public class SheveryProvider extends ContentProvider {
                 }
                 break;
             }
+            case METHOD_SEND_USER_SERVICE: {
+                return handleSendUserService(extras);
+            }
             default:
                 return null;
         }
@@ -189,11 +206,9 @@ public class SheveryProvider extends ContentProvider {
         Context ctx = getContext();
         if (receivedBinder != null && ctx != null) {
             Log.d(TAG, "Native Shevery binder received for " + ctx.getPackageName());
-            SheveryPrivilege.onBinderReceived(receivedBinder, ctx.getPackageName());
+            dispatchBinderToFacades(receivedBinder, ctx.getPackageName());
 
             if (enableMultiProcess) {
-                // Signal only: the receiving process pulls the binder from our provider
-                // instead of trusting an IBinder carried in an unprotected broadcast.
                 Intent intent = new Intent(ACTION_BINDER_RECEIVED)
                         .setPackage(ctx.getPackageName());
                 ctx.sendBroadcast(intent);
@@ -210,6 +225,53 @@ public class SheveryProvider extends ContentProvider {
         reply.putParcelable(SheveryApiConstants.EXTRA_BINDER, container);
         reply.putParcelable(SheveryApiConstants.LEGACY_EXTRA_BINDER, container);
         return true;
+    }
+
+    @Nullable
+    private Bundle handleSendUserService(@NonNull Bundle extras) {
+        Log.i(TAG, "handleSendUserService called");
+        IShizukuService service = null;
+        try {
+            service = SheveryPrivilege.requireService();
+        } catch (Throwable ignored) {
+        }
+        if (service == null) {
+            Log.e(TAG, "Shevery daemon service not available for user-service attach");
+            return null;
+        }
+
+        extras.setClassLoader(BinderContainer.class.getClassLoader());
+        IBinder userServiceBinder = LegacyParcelCodec.extractBinderFromBundle(extras);
+        if (userServiceBinder == null) {
+            BinderContainer container = extras.getParcelable(SheveryApiConstants.EXTRA_BINDER);
+            if (container == null) {
+                container = extras.getParcelable(SheveryApiConstants.LEGACY_EXTRA_BINDER);
+            }
+            if (container != null) {
+                userServiceBinder = container.binder;
+            }
+        }
+
+        if (userServiceBinder == null) {
+            Log.e(TAG, "No valid IBinder in user service arguments");
+            return null;
+        }
+
+        try {
+            service.attachUserService(userServiceBinder, extras);
+        } catch (Throwable e) {
+            Log.e(TAG, "Failed to attach user service", e);
+            return null;
+        }
+
+        Bundle reply = new Bundle();
+        IBinder activeBinder = SheveryPrivilege.getBinder();
+        if (activeBinder != null) {
+            BinderContainer container = new BinderContainer(activeBinder);
+            reply.putParcelable(SheveryApiConstants.EXTRA_BINDER, container);
+            reply.putParcelable(SheveryApiConstants.LEGACY_EXTRA_BINDER, container);
+        }
+        return reply;
     }
 
     @Nullable

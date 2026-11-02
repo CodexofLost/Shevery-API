@@ -18,8 +18,11 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
 import com.hamondev.shevery.api.LegacyParcelCodec;
+import com.hamondev.shevery.api.SheveryApiConstants;
+import com.hamondev.shevery.api.SheveryPrivilege;
 
 import moe.shizuku.api.BinderContainer;
+import moe.shizuku.server.IShizukuService;
 import rikka.sui.Sui;
 
 public class ShizukuProvider extends ContentProvider {
@@ -31,6 +34,9 @@ public class ShizukuProvider extends ContentProvider {
 
     // For share Binder between processes
     public static final String METHOD_GET_BINDER = "getBinder";
+
+    // For user service attachment
+    public static final String METHOD_SEND_USER_SERVICE = "sendUserService";
 
     public static final String ACTION_BINDER_RECEIVED = "moe.shizuku.api.action.BINDER_RECEIVED";
 
@@ -73,13 +79,11 @@ public class ShizukuProvider extends ContentProvider {
         if (receiver == null) {
             receiver = new BroadcastReceiver() {
                 @Override
-                public void onReceive(Context context, Intent intent) {
-                    // Signal-only broadcast: pull the binder from our own provider after
-                    // verifying that its authority still belongs to this application.
-                    IBinder extracted = callOwnProvider(context);
+                public void onReceive(Context ctx, Intent intent) {
+                    IBinder extracted = callOwnProvider(ctx);
                     if (extracted != null) {
                         Log.i(TAG, "binder received from broadcast");
-                        Shizuku.onBinderReceived(extracted, context.getPackageName());
+                        dispatchBinderToFacades(extracted, ctx.getPackageName());
                     }
                 }
             };
@@ -94,7 +98,7 @@ public class ShizukuProvider extends ContentProvider {
         IBinder extracted = callOwnProvider(context);
         if (extracted != null) {
             Log.i(TAG, "Binder received from other process");
-            Shizuku.onBinderReceived(extracted, context.getPackageName());
+            dispatchBinderToFacades(extracted, context.getPackageName());
         }
     }
 
@@ -102,8 +106,12 @@ public class ShizukuProvider extends ContentProvider {
     private static IBinder callOwnProvider(@NonNull Context context) {
         final String pkg = context.getPackageName();
         final String authority = pkg + ".shizuku";
-        ProviderInfo providerInfo = context.getPackageManager().resolveContentProvider(authority, 0);
-        if (providerInfo == null || !pkg.equals(providerInfo.packageName)) {
+        ProviderInfo providerInfo = null;
+        try {
+            providerInfo = context.getPackageManager().resolveContentProvider(authority, 0);
+        } catch (Throwable ignored) {
+        }
+        if (providerInfo != null && !pkg.equals(providerInfo.packageName)) {
             return null;
         }
 
@@ -128,6 +136,14 @@ public class ShizukuProvider extends ContentProvider {
             return extracted;
         } catch (Throwable ignored) {
             return null;
+        }
+    }
+
+    private static void dispatchBinderToFacades(@NonNull IBinder binder, @NonNull String packageName) {
+        Shizuku.onBinderReceived(binder, packageName);
+        try {
+            SheveryPrivilege.onBinderReceived(binder, packageName);
+        } catch (Throwable ignored) {
         }
     }
 
@@ -162,7 +178,7 @@ public class ShizukuProvider extends ContentProvider {
         }
 
         if (extras == null) {
-            return null;
+            extras = new Bundle();
         }
 
         Bundle reply = new Bundle();
@@ -176,6 +192,9 @@ public class ShizukuProvider extends ContentProvider {
                     return null;
                 }
                 break;
+            }
+            case METHOD_SEND_USER_SERVICE: {
+                return handleSendUserService(extras);
             }
         }
         return reply;
@@ -196,14 +215,12 @@ public class ShizukuProvider extends ContentProvider {
             }
         }
         if (receivedBinder != null) {
-            Log.d(TAG, "binder received");
+            Log.d(TAG, "binder received in ShizukuProvider");
 
-            Shizuku.onBinderReceived(receivedBinder, getContext().getPackageName());
+            dispatchBinderToFacades(receivedBinder, getContext().getPackageName());
 
             if (enableMultiProcess) {
                 Log.d(TAG, "broadcast binder");
-
-                // Signal only: never carry the binder over an unprotected broadcast.
                 Intent intent = new Intent(ACTION_BINDER_RECEIVED)
                         .setPackage(getContext().getPackageName());
                 getContext().sendBroadcast(intent);
@@ -213,11 +230,62 @@ public class ShizukuProvider extends ContentProvider {
 
     private boolean handleGetBinder(@NonNull Bundle reply) {
         IBinder binder = Shizuku.getBinder();
-        if (binder == null || !binder.pingBinder())
+        if (binder == null || !binder.pingBinder()) {
+            binder = SheveryPrivilege.getBinder();
+        }
+        if (binder == null || !binder.pingBinder()) {
             return false;
+        }
 
         reply.putParcelable(EXTRA_BINDER, new BinderContainer(binder));
+        reply.putParcelable(SheveryApiConstants.EXTRA_BINDER, new BinderContainer(binder));
         return true;
+    }
+
+    @Nullable
+    private Bundle handleSendUserService(@NonNull Bundle extras) {
+        Log.i(TAG, "handleSendUserService called in ShizukuProvider");
+        IShizukuService service = null;
+        try {
+            service = Shizuku.requireService();
+        } catch (Throwable ignored) {
+            try {
+                service = SheveryPrivilege.requireService();
+            } catch (Throwable ignored2) {
+            }
+        }
+        if (service == null) {
+            Log.e(TAG, "No service available for user service attach");
+            return null;
+        }
+
+        extras.setClassLoader(BinderContainer.class.getClassLoader());
+        IBinder userServiceBinder = LegacyParcelCodec.extractBinderFromBundle(extras);
+        if (userServiceBinder == null) {
+            BinderContainer container = extras.getParcelable(EXTRA_BINDER);
+            if (container != null) {
+                userServiceBinder = container.binder;
+            }
+        }
+
+        if (userServiceBinder == null) {
+            Log.e(TAG, "No valid IBinder in user service arguments");
+            return null;
+        }
+
+        try {
+            service.attachUserService(userServiceBinder, extras);
+        } catch (Throwable e) {
+            Log.e(TAG, "Failed to attach user service", e);
+            return null;
+        }
+
+        Bundle reply = new Bundle();
+        IBinder activeBinder = Shizuku.getBinder();
+        if (activeBinder != null) {
+            reply.putParcelable(EXTRA_BINDER, new BinderContainer(activeBinder));
+        }
+        return reply;
     }
 
     @Nullable
