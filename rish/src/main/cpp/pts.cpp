@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <android/log.h>
 #include <pthread.h>
+#include <poll.h>
 #include <sys/sendfile.h>
 #include <functional>
 #include "logging.h"
@@ -56,40 +57,71 @@ struct transfer_thread_data {
     int out;
     bool close_in;
     bool close_out;
-    std::function<void()> function;
+    bool watch_out;
+    std::function<void(bool)> function;
 };
 
-void transfer(int in, int out, bool close_in, bool close_out, const std::function<void()> &function) {
+// Adapted from Porter API (porsh/src/main/cpp/pts.cpp):
+// Reports whether the relay failed rather than reaching normal EOF on input.
+// With watch_out enabled, poll() detects when the output pipe loses its reader
+// even while input has nothing to send.
+void transfer(int in, int out, bool close_in, bool close_out, bool watch_out,
+              const std::function<void(bool)> &function) {
     char buf[8192];
     int len;
-    while ((len = TEMP_FAILURE_RETRY(read(in, buf, 8192))) > 0) {
+    bool failed = false;
+    while (true) {
+        if (watch_out) {
+            pollfd fds[] = {{in, POLLIN, 0}, {out, 0, 0}};
+            if (TEMP_FAILURE_RETRY(poll(fds, 2, -1)) == -1) {
+                failed = true;
+                break;
+            }
+            if (fds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                failed = true;
+                break;
+            }
+        }
+        if ((len = TEMP_FAILURE_RETRY(read(in, buf, 8192))) <= 0) {
+            break;
+        }
         if (write_full(out, buf, len) == -1) {
-            //PLOGE("write");
+            failed = true;
             break;
         }
     }
-    //PLOGE("read");
 
     if (close_in) close(in);
     if (close_out) close(out);
-    if (function) function();
+    if (function) function(failed);
 }
 
 static void *transfer_thread(void *_data) {
     auto data = (transfer_thread_data *) _data;
-    transfer(data->in, data->out, data->close_in, data->close_out, data->function);
+    transfer(data->in, data->out, data->close_in, data->close_out, data->watch_out, data->function);
     delete data;
     return nullptr;
 }
 
-void transfer_async(int in, int out, const std::function<void()> &function, bool close_in, bool close_out) {
+void transfer_async(int in, int out, const std::function<void(bool)> &function, bool close_in, bool close_out,
+                    bool watch_out) {
     pthread_t pthread;
-    auto *data = new transfer_thread_data{in, out, close_in, close_out, function};
-    pthread_create(&pthread, nullptr, transfer_thread, data);
+    auto *data = new transfer_thread_data{in, out, close_in, close_out, watch_out, function};
+    int err = pthread_create(&pthread, nullptr, transfer_thread, data);
+    if (err != 0) {
+        errno = err;
+        PLOGE("pthread_create");
+        delete data;
+        if (close_in) close(in);
+        if (close_out) close(out);
+        if (function) function(true);
+        return;
+    }
+    pthread_detach(pthread);
 }
 
 int open_ptmx() {
-    int fd = open("/dev/ptmx", O_RDWR);
+    int fd = open("/dev/ptmx", O_RDWR | O_CLOEXEC);
     if (fd == -1) {
         return -1;
     }
