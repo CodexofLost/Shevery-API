@@ -27,6 +27,7 @@ public final class SheveryApiConstants {
     // Bounds for fast one-shot command execution (adapted from Nightzuku API)
     public static final int EXEC_FAST_MAX_OUTPUT_BYTES = 256 * 1024;
     public static final long EXEC_FAST_DEFAULT_TIMEOUT_MS = 30_000L;
+    public static final long EXEC_FAST_MAX_TIMEOUT_MS = 120_000L;
 
     // Fine-grained capability bitmasks stored in upper bits of ConfigManager flags (adapted from Nightzuku API)
     public static final int CAP_SHELL_EXEC = 1 << 8;

@@ -74,14 +74,9 @@ public class ShizukuProvider extends ContentProvider {
             receiver = new BroadcastReceiver() {
                 @Override
                 public void onReceive(Context context, Intent intent) {
-                    IBinder extracted = LegacyParcelCodec.extractBinderFromBundle(intent.getExtras());
-                    if (extracted == null) {
-                        intent.setExtrasClassLoader(BinderContainer.class.getClassLoader());
-                        BinderContainer container = intent.getParcelableExtra(EXTRA_BINDER);
-                        if (container != null) {
-                            extracted = container.binder;
-                        }
-                    }
+                    // Signal-only broadcast: pull the binder from our own provider after
+                    // verifying that its authority still belongs to this application.
+                    IBinder extracted = callOwnProvider(context);
                     if (extracted != null) {
                         Log.i(TAG, "binder received from broadcast");
                         Shizuku.onBinderReceived(extracted, context.getPackageName());
@@ -96,15 +91,32 @@ public class ShizukuProvider extends ContentProvider {
             }
         }
 
-        Bundle reply;
-        try {
-            reply = context.getContentResolver().call(Uri.parse("content://" + context.getPackageName() + ".shizuku"),
-                    ShizukuProvider.METHOD_GET_BINDER, null, new Bundle());
-        } catch (Throwable tr) {
-            reply = null;
+        IBinder extracted = callOwnProvider(context);
+        if (extracted != null) {
+            Log.i(TAG, "Binder received from other process");
+            Shizuku.onBinderReceived(extracted, context.getPackageName());
+        }
+    }
+
+    @Nullable
+    private static IBinder callOwnProvider(@NonNull Context context) {
+        final String pkg = context.getPackageName();
+        final String authority = pkg + ".shizuku";
+        ProviderInfo providerInfo = context.getPackageManager().resolveContentProvider(authority, 0);
+        if (providerInfo == null || !pkg.equals(providerInfo.packageName)) {
+            return null;
         }
 
-        if (reply != null) {
+        try {
+            Bundle reply = context.getContentResolver().call(
+                    Uri.parse("content://" + authority),
+                    ShizukuProvider.METHOD_GET_BINDER,
+                    null,
+                    new Bundle()
+            );
+            if (reply == null) {
+                return null;
+            }
             IBinder extracted = LegacyParcelCodec.extractBinderFromBundle(reply);
             if (extracted == null) {
                 reply.setClassLoader(BinderContainer.class.getClassLoader());
@@ -113,10 +125,9 @@ public class ShizukuProvider extends ContentProvider {
                     extracted = container.binder;
                 }
             }
-            if (extracted != null) {
-                Log.i(TAG, "Binder received from other process");
-                Shizuku.onBinderReceived(extracted, context.getPackageName());
-            }
+            return extracted;
+        } catch (Throwable ignored) {
+            return null;
         }
     }
 
@@ -192,8 +203,8 @@ public class ShizukuProvider extends ContentProvider {
             if (enableMultiProcess) {
                 Log.d(TAG, "broadcast binder");
 
+                // Signal only: never carry the binder over an unprotected broadcast.
                 Intent intent = new Intent(ACTION_BINDER_RECEIVED)
-                        .putExtra(EXTRA_BINDER, new BinderContainer(receivedBinder))
                         .setPackage(getContext().getPackageName());
                 getContext().sendBroadcast(intent);
             }

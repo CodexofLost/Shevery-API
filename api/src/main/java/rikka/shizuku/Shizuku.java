@@ -150,8 +150,16 @@ public class Shizuku {
             service = null;
             serverUid = -1;
             serverApiVersion = -1;
+            serverPatchVersion = -1;
             serverContext = null;
             permissionGranted = false;
+            shouldShowRequestPermissionRationale = false;
+            binderReady = false;
+
+            // Mirror the reset into the Shevery facade so both wrappers agree on the
+            // server state after the binder dies.
+            com.hamondev.shevery.api.SheveryPrivilege.syncFromShizuku(
+                    null, -1, -1, -1, null, false, false);
 
             scheduleBinderDeadListeners();
         } else {

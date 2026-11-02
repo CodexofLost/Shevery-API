@@ -2,6 +2,7 @@
 #include <unistd.h>
 #include <termios.h>
 #include <fcntl.h>
+#include <cerrno>
 #include <cstdlib>
 #include <wait.h>
 #include <android/log.h>
@@ -37,6 +38,12 @@ static void *xmalloc(JNIEnv *env, size_t size) {
 
 static const char *getBytes(JNIEnv *env, jbyteArray arr) {
     return arr == nullptr ? nullptr : (const char *) env->GetByteArrayElements(arr, nullptr);
+}
+
+static void closeIfValid(int fd) {
+    if (fd != -1) {
+        close(fd);
+    }
 }
 
 static void releaseBytes(JNIEnv *env, jbyteArray arr, const char *parr) {
@@ -101,6 +108,10 @@ static jintArray RishHost_startHost(
 
     const char *pargBlock = getBytes(env, argBlock);
     const char **argv = NEW(const char *, argc + 2);
+    if (argv == nullptr) {
+        releaseBytes(env, argBlock, pargBlock);
+        return nullptr;
+    }
     argv[0] = "/system/bin/sh";
     initVectorFromBlock(argv + 1, pargBlock, argc);
 
@@ -113,6 +124,12 @@ static jintArray RishHost_startHost(
     if (envc > 0) {
         penvBlock = getBytes(env, envBlock);
         envv = NEW(const char *, envc + 1);
+        if (envv == nullptr) {
+            free(argv);
+            releaseBytes(env, argBlock, pargBlock);
+            releaseBytes(env, envBlock, penvBlock);
+            return nullptr;
+        }
 
         initVectorFromBlock(envv, penvBlock, envc);
     }
@@ -124,15 +141,30 @@ static jintArray RishHost_startHost(
 
     auto pid = fork();
     if (pid == -1) {
+        free(argv);
+        free(envv);
         releaseBytes(env, argBlock, pargBlock);
         releaseBytes(env, envBlock, penvBlock);
         releaseBytes(env, dirBlock, pdir);
+
+        closeIfValid(ptmx);
+        closeIfValid(stdin_pipe[0]);
+        closeIfValid(stdin_pipe[1]);
+        closeIfValid(stdout_pipe[0]);
+        closeIfValid(stdout_pipe[1]);
+        closeIfValid(stderr_pipe[0]);
+        closeIfValid(stderr_pipe[1]);
+        closeIfValid(stdin_read);
+        closeIfValid(stdout_write);
+        closeIfValid(stderr_write);
 
         env->ThrowNew(env->FindClass("java/lang/IllegalStateException"), "Unable to fork");
         return nullptr;
     }
 
     if (pid > 0) {
+        free(argv);
+        free(envv);
         releaseBytes(env, argBlock, pargBlock);
         releaseBytes(env, envBlock, penvBlock);
         releaseBytes(env, dirBlock, pdir);
@@ -302,7 +334,15 @@ static jint RishHost_waitFor(JNIEnv *env, jclass clazz, jint pid) {
     LOGD("waitFor %d", pid);
 
     int status;
-    if (waitpid(pid, &status, 0) == -1) {
+    pid_t ret;
+    do {
+        ret = TEMP_FAILURE_RETRY(waitpid(pid, &status, 0));
+    } while (ret != -1 && !WIFEXITED(status) && !WIFSIGNALED(status));
+
+    if (ret == -1) {
+        if (errno == ECHILD) {
+            return 0;
+        }
         PLOGE("waitpid");
         return -1;
     }

@@ -15,6 +15,7 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.ServiceConnection;
 import android.content.pm.PackageManager;
+import android.content.pm.ProviderInfo;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
@@ -243,6 +244,13 @@ public final class SheveryPrivilege {
         };
 
         for (String authority : authorities) {
+            final String expectedPackage = authority.equals(pkg + SheveryApiConstants.PROVIDER_SUFFIX)
+                    ? pkg
+                    : SheveryApiConstants.MANAGER_APPLICATION_ID;
+            ProviderInfo providerInfo = context.getPackageManager().resolveContentProvider(authority, 0);
+            if (providerInfo == null || !expectedPackage.equals(providerInfo.packageName)) {
+                continue;
+            }
             try {
                 Bundle extras = new Bundle();
                 extras.putString(ATTACH_APPLICATION_PACKAGE_NAME, pkg);
@@ -322,6 +330,10 @@ public final class SheveryPrivilege {
             shouldShowRequestPermissionRationale = false;
             capabilitiesMask = 0;
             binderReady = false;
+
+            // Keep the Shizuku compatibility facade in sync; otherwise Shizuku.getBinder()
+            // would keep exposing the dead binder after this death recipient fires.
+            Shizuku.syncFromShevery(null, -1, -1, -1, null, false, false);
 
             dispatchBinderDead();
             return;

@@ -54,17 +54,10 @@ public class SheveryProvider extends ContentProvider {
             multiProcessReceiver = new BroadcastReceiver() {
                 @Override
                 public void onReceive(Context ctx, Intent intent) {
-                    IBinder extracted = LegacyParcelCodec.extractBinderFromBundle(intent.getExtras());
-                    if (extracted == null) {
-                        intent.setExtrasClassLoader(BinderContainer.class.getClassLoader());
-                        BinderContainer container = intent.getParcelableExtra(SheveryApiConstants.EXTRA_BINDER);
-                        if (container == null) {
-                            container = intent.getParcelableExtra(SheveryApiConstants.LEGACY_EXTRA_BINDER);
-                        }
-                        if (container != null) {
-                            extracted = container.binder;
-                        }
-                    }
+                    // The broadcast is only a signal: never trust a binder shipped in its
+                    // extras. Pull it from our own provider after verifying the authority
+                    // still belongs to this application.
+                    IBinder extracted = callOwnProvider(ctx);
                     if (extracted != null) {
                         SheveryPrivilege.onBinderReceived(extracted, ctx.getPackageName());
                     }
@@ -82,27 +75,42 @@ public class SheveryProvider extends ContentProvider {
             return;
         }
 
+        IBinder extracted = callOwnProvider(context);
+        if (extracted != null) {
+            SheveryPrivilege.onBinderReceived(extracted, context.getPackageName());
+        }
+    }
+
+    @Nullable
+    private static IBinder callOwnProvider(@NonNull Context context) {
+        final String pkg = context.getPackageName();
+        final String authority = pkg + SheveryApiConstants.PROVIDER_SUFFIX;
+        ProviderInfo providerInfo = context.getPackageManager().resolveContentProvider(authority, 0);
+        if (providerInfo == null || !pkg.equals(providerInfo.packageName)) {
+            return null;
+        }
+
         try {
             Bundle reply = context.getContentResolver().call(
-                    Uri.parse("content://" + context.getPackageName() + SheveryApiConstants.PROVIDER_SUFFIX),
+                    Uri.parse("content://" + authority),
                     METHOD_GET_BINDER,
                     null,
                     new Bundle()
             );
-            if (reply != null) {
-                IBinder extracted = LegacyParcelCodec.extractBinderFromBundle(reply);
-                if (extracted == null) {
-                    reply.setClassLoader(BinderContainer.class.getClassLoader());
-                    BinderContainer container = reply.getParcelable(SheveryApiConstants.EXTRA_BINDER);
-                    if (container != null) {
-                        extracted = container.binder;
-                    }
-                }
-                if (extracted != null) {
-                    SheveryPrivilege.onBinderReceived(extracted, context.getPackageName());
+            if (reply == null) {
+                return null;
+            }
+            IBinder extracted = LegacyParcelCodec.extractBinderFromBundle(reply);
+            if (extracted == null) {
+                reply.setClassLoader(BinderContainer.class.getClassLoader());
+                BinderContainer container = reply.getParcelable(SheveryApiConstants.EXTRA_BINDER);
+                if (container != null) {
+                    extracted = container.binder;
                 }
             }
+            return extracted;
         } catch (Throwable ignored) {
+            return null;
         }
     }
 
@@ -177,9 +185,9 @@ public class SheveryProvider extends ContentProvider {
             SheveryPrivilege.onBinderReceived(receivedBinder, ctx.getPackageName());
 
             if (enableMultiProcess) {
-                BinderContainer container = new BinderContainer(receivedBinder);
+                // Signal only: the receiving process pulls the binder from our provider
+                // instead of trusting an IBinder carried in an unprotected broadcast.
                 Intent intent = new Intent(ACTION_BINDER_RECEIVED)
-                        .putExtra(SheveryApiConstants.EXTRA_BINDER, container)
                         .setPackage(ctx.getPackageName());
                 ctx.sendBroadcast(intent);
             }

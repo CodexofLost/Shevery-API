@@ -158,9 +158,7 @@ public abstract class Service<
             throw new SecurityException(msg);
         }
 
-        if (requiredCapability != 0
-                && clientRecord.capabilities != 0
-                && (clientRecord.capabilities & requiredCapability) == 0) {
+        if (requiredCapability != 0 && !clientRecord.hasCapability(requiredCapability)) {
             String msg = "Permission Denial: " + func + " from pid="
                     + callingPid
                     + " lacks capability 0x" + Integer.toHexString(requiredCapability);
@@ -290,6 +288,7 @@ public abstract class Service<
     @Override
     public final int removeUserService(IShizukuServiceConnection conn, Bundle options) {
         enforceCallingCapability("removeUserService", SheveryApiConstants.CAP_USER_SERVICE);
+        confineToFramework(options);
         if (options == null) {
             throw new NullPointerException("options is null");
         }
@@ -300,6 +299,7 @@ public abstract class Service<
     @Override
     public final int addUserService(IShizukuServiceConnection conn, Bundle options) {
         enforceCallingCapability("addUserService", SheveryApiConstants.CAP_USER_SERVICE);
+        confineToFramework(options);
         if (conn == null) {
             throw new NullPointerException("connection is null");
         }
@@ -322,6 +322,10 @@ public abstract class Service<
 
     @Override
     public void attachUserService(IBinder binder, Bundle options) {
+        int callingUid = Binder.getCallingUid();
+        if (callingUid != OsUtils.getUid() && callingUid != 0 && callingUid != 2000) {
+            enforceManagerPermission("attachUserService");
+        }
         confineToFramework(options);
         userServiceManager.attachUserService(binder, options);
     }
@@ -451,6 +455,7 @@ public abstract class Service<
         if (timeoutMs <= 0) {
             timeoutMs = SheveryApiConstants.EXEC_FAST_DEFAULT_TIMEOUT_MS;
         }
+        timeoutMs = Math.min(timeoutMs, SheveryApiConstants.EXEC_FAST_MAX_TIMEOUT_MS);
 
         String[] finalEnv = normalizeEnvironment(env);
         File workingDir = dir != null ? new File(dir) : null;
@@ -503,6 +508,18 @@ public abstract class Service<
                     }
                 }
             }
+            if (timedOut) {
+                // Force-close the pipes so readers blocked on child processes that inherited
+                // stdout/stderr are released. Adapted from Porter API.
+                try {
+                    process.getInputStream().close();
+                } catch (IOException ignored) {
+                }
+                try {
+                    process.getErrorStream().close();
+                } catch (IOException ignored) {
+                }
+            }
             outReader.join(1000);
             errReader.join(1000);
         } catch (InterruptedException e) {
@@ -530,6 +547,9 @@ public abstract class Service<
                 if (toWrite > 0) {
                     out.write(buf, 0, toWrite);
                     remaining -= toWrite;
+                }
+                if (remaining <= 0) {
+                    break;
                 }
             }
         } catch (IOException ignored) {

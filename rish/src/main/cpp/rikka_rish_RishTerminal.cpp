@@ -2,6 +2,7 @@
 #include <unistd.h>
 #include <termios.h>
 #include <fcntl.h>
+#include <cerrno>
 #include <cstdlib>
 #include <android/log.h>
 #include <pthread.h>
@@ -10,7 +11,8 @@
 #include "logging.h"
 #include "pts.h"
 
-static pthread_mutex_t mutex, winch_mutex;
+static pthread_mutex_t mutex;
+static int winch_pipe[2] = {-1, -1};
 static struct termios old_stdin{};
 static int tty_in_raw = 0;
 
@@ -101,8 +103,12 @@ static jint RishTerminal_start(
     }
 
     auto sigwinch_handler = [](int sig) {
-        if (pthread_mutex_unlock(&winch_mutex) != 0) {
-            PLOGE("pthread_mutex_unlock");
+        // async-signal-safe: notify the waiter through a self-pipe instead of
+        // touching a mutex from the signal handler.
+        char b = 1;
+        if (winch_pipe[1] != -1) {
+            ssize_t ignored = write(winch_pipe[1], &b, 1);
+            (void) ignored;
         }
     };
 
@@ -112,8 +118,9 @@ static jint RishTerminal_start(
 }
 
 static jlong RishTerminal_waitForWindowSizeChange(JNIEnv *env, jclass clazz, jint fd) {
-    if (pthread_mutex_lock(&winch_mutex) != 0) {
-        PLOGE("pthread_mutex_lock");
+    if (winch_pipe[0] != -1) {
+        char b;
+        TEMP_FAILURE_RETRY(read(winch_pipe[0], &b, 1));
     }
 
     return (jlong) getWindowSize(fd);
@@ -131,7 +138,15 @@ static void RishTerminal_waitForProcessExit(JNIEnv *env, jclass clazz) {
 
 int rikka_rish_RishTerminal_registerNatives(JNIEnv *env) {
     pthread_mutex_init(&mutex, nullptr);
-    pthread_mutex_init(&winch_mutex, nullptr);
+
+    if (pipe2(winch_pipe, O_CLOEXEC) == 0) {
+        int flags = fcntl(winch_pipe[1], F_GETFL);
+        if (flags != -1) {
+            fcntl(winch_pipe[1], F_SETFL, flags | O_NONBLOCK);
+        }
+    } else {
+        PLOGE("pipe2");
+    }
 
     auto clazz = env->FindClass("rikka/rish/RishTerminal");
     JNINativeMethod methods[] = {

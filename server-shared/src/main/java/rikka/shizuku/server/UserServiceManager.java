@@ -20,6 +20,7 @@ import android.os.Parcel;
 import android.text.format.DateUtils;
 import android.util.ArrayMap;
 
+import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -30,6 +31,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import moe.shizuku.server.IShizukuServiceConnection;
 import rikka.hidden.compat.PackageManagerApis;
@@ -207,11 +209,11 @@ public abstract class UserServiceManager {
 
         if (record != null) {
             if (record.versionCode != versionCode) {
-                LOGGER.v("Remove service record %s (%s) because version code not matched (old=%d, new=%d)", key, record.token, record.versionCode, versionCode);
+                LOGGER.v("Remove service record %s because version code not matched (old=%d, new=%d)", key, record.versionCode, versionCode);
             } else if (!record.starting && (record.service == null || !record.service.pingBinder())) {
-                LOGGER.v("Service in record %s (%s) is dead", key, record.token);
+                LOGGER.v("Service in record %s is dead", key);
             } else {
-                LOGGER.i("Found existing service record %s (%s)", key, record.token);
+                LOGGER.i("Found existing service record %s", key);
 
                 if (record.daemon != daemon) {
                     record.setDaemon(daemon);
@@ -244,7 +246,7 @@ public abstract class UserServiceManager {
         onUserServiceRecordCreated(record, packageInfo);
 
         userServiceRecords.put(key, record);
-        LOGGER.i("New service record %s (%s): version=%d, daemon=%s, apk=%s", key, record.token, versionCode, Boolean.toString(daemon), packageInfo.applicationInfo.sourceDir);
+        LOGGER.i("New service record %s: version=%d, daemon=%s, apk=%s", key, versionCode, Boolean.toString(daemon), packageInfo.applicationInfo.sourceDir);
         return record;
     }
 
@@ -253,33 +255,47 @@ public abstract class UserServiceManager {
             String classname, String processNameSuffix, int callingUid, boolean use32Bits, boolean debug) {
 
         if (record.removed || record.pendingDestroy) {
-            LOGGER.v("Service record %s (%s) was removed before it could start", key, token);
+            LOGGER.v("Service record %s was removed before it could start", key);
             return;
         }
 
-        LOGGER.v("Starting process for service record %s (%s)...", key, token);
+        LOGGER.v("Starting process for service record %s...", key);
 
         String cmd = getUserServiceStartCmd(record, key, token, packageName, classname, processNameSuffix, callingUid, use32Bits && AbiUtil.has32Bit(), debug);
         int exitCode;
         java.lang.Process process = null;
         try {
             process = Runtime.getRuntime().exec("sh");
+            // Drain/close the shell's output pipes so a chatty or blocked child cannot
+            // stall waitFor() forever. Adapted from Porter API.
+            try {
+                process.getInputStream().close();
+            } catch (IOException ignored) {
+            }
+            try {
+                process.getErrorStream().close();
+            } catch (IOException ignored) {
+            }
             try (OutputStream os = process.getOutputStream()) {
                 os.write(cmd.getBytes(StandardCharsets.UTF_8));
                 os.flush();
             }
 
-            exitCode = process.waitFor();
+            if (!process.waitFor(15, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                throw new IllegalStateException("Timed out waiting for user service process");
+            }
+            exitCode = process.exitValue();
         } catch (Throwable e) {
             if (process != null) {
                 process.destroy();
             }
-            LOGGER.w("Failed to start process for service record %s (%s): %s", key, token, e.getMessage());
+            LOGGER.w("Failed to start process for service record %s: %s", key, e.getMessage());
             dropRecordIfNotAttachedLocked(record);
             return;
         }
         if (exitCode != 0) {
-            LOGGER.w("Process for service record %s (%s) exited with %d before attaching", key, token, exitCode);
+            LOGGER.w("Process for service record %s exited with %d before attaching", key, exitCode);
             dropRecordIfNotAttachedLocked(record);
         }
     }
@@ -295,7 +311,7 @@ public abstract class UserServiceManager {
                     && record.spawnAttempts < MAX_SPAWN_RETRIES) {
                 record.spawnAttempts++;
                 LOGGER.w("Spawn for service record %s failed with %d waiting connection(s); respawning (attempt %d/%d)",
-                        record.token, record.callbacks.getRegisteredCallbackCount(), record.spawnAttempts, MAX_SPAWN_RETRIES);
+                        record.hashCode(), record.callbacks.getRegisteredCallbackCount(), record.spawnAttempts, MAX_SPAWN_RETRIES);
                 executor.execute(record.spawnRunnable);
                 return;
             }
@@ -317,19 +333,25 @@ public abstract class UserServiceManager {
         }
 
         if (entry == null) {
-            LOGGER.w("Attach for unknown/expired token %s: no matching record, destroying the attaching binder instead", token);
+            LOGGER.w("Attach for unknown/expired token: no matching record, destroying the attaching binder instead");
             destroyUnknownBinder(binder);
             return;
         }
 
-        LOGGER.v("Received binder for service record %s", token);
-
         UserServiceRecord record = entry.getValue();
+        if (record.removed || record.service != null) {
+            LOGGER.w("Rejecting duplicate attach for service record %s", entry.getKey());
+            destroyUnknownBinder(binder);
+            return;
+        }
+
+        LOGGER.v("Received binder for service record %s", entry.getKey());
+
         record.setBinder(binder);
     }
 
     private void destroyUnknownBinder(IBinder binder) {
-        if (binder == null || !binder.pingBinder()) {
+        if (binder == null || binder instanceof Binder || !binder.pingBinder()) {
             return;
         }
         String descriptor;
@@ -380,7 +402,7 @@ public abstract class UserServiceManager {
             }
             for (UserServiceRecord record : snapshot) {
                 record.removeSelf();
-                LOGGER.i("Remove user service %s for package %s", record.token, packageName);
+                LOGGER.i("Remove user service for package %s", packageName);
             }
         }
     }
