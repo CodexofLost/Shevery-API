@@ -25,7 +25,7 @@ public class ClientManager<ConfigMgr extends ConfigManager> {
     }
 
     public List<ClientRecord> findClients(int uid) {
-        synchronized (this) {
+        synchronized (clientRecords) {
             List<ClientRecord> res = new ArrayList<>();
             for (ClientRecord clientRecord : clientRecords) {
                 if (clientRecord.uid == uid) {
@@ -37,7 +37,7 @@ public class ClientManager<ConfigMgr extends ConfigManager> {
     }
 
     public ClientRecord findClient(int uid, int pid) {
-        synchronized (this) {
+        synchronized (clientRecords) {
             for (ClientRecord clientRecord : clientRecords) {
                 if (clientRecord.pid == pid && clientRecord.uid == uid) {
                     return clientRecord;
@@ -64,15 +64,23 @@ public class ClientManager<ConfigMgr extends ConfigManager> {
     }
 
     public ClientRecord addClient(int uid, int pid, IShizukuApplication client, String packageName, int apiVersion) {
+        if (client == null || packageName == null) {
+            return null;
+        }
         ClientRecord clientRecord = new ClientRecord(uid, pid, client, packageName, apiVersion);
 
+        // Decide permission & capabilities before publishing record (adapted from Porter API & Nightzuku API)
         ConfigPackageEntry entry = configManager.find(uid);
         if (entry != null && entry.isAllowed()) {
             clientRecord.allowed = true;
+            clientRecord.capabilities = entry.getCapabilities();
         }
 
         IBinder binder = client.asBinder();
-        IBinder.DeathRecipient deathRecipient = () -> clientRecords.remove(clientRecord);
+        IBinder.DeathRecipient deathRecipient = () -> {
+            clientRecords.remove(clientRecord);
+            onClientDied(clientRecord);
+        };
         try {
             binder.linkToDeath(deathRecipient, 0);
         } catch (RemoteException e) {
@@ -83,6 +91,10 @@ public class ClientManager<ConfigMgr extends ConfigManager> {
         clientRecords.add(clientRecord);
         return clientRecord;
     }
+
+    /**
+     * Hook invoked on a binder thread after a client's process dies and its record is removed.
+     */
+    protected void onClientDied(ClientRecord record) {
+    }
 }
-
-
