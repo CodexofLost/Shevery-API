@@ -1,6 +1,7 @@
 package rikka.shizuku.server;
 
 import android.os.Binder;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.IBinder;
 import android.os.Parcel;
@@ -13,11 +14,16 @@ import androidx.annotation.CallSuper;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
+import com.hamondev.shevery.api.SheveryApiConstants;
+
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 import moe.shizuku.server.IRemoteProcess;
 import moe.shizuku.server.IShizukuApplication;
@@ -37,6 +43,9 @@ public abstract class Service<
         ClientMgr extends ClientManager<ConfigMgr>,
         ConfigMgr extends ConfigManager> extends IShizukuService.Stub {
 
+    private static final String DEFAULT_PATH =
+            "/product/bin:/apex/com.android.runtime/bin:/apex/com.android.art/bin:/system_ext/bin:/system/bin:/system/xbin:/odm/bin:/vendor/bin:/vendor/xbin";
+
     private final UserServiceMgr userServiceManager;
     private final ConfigMgr configManager;
     private final ClientMgr clientManager;
@@ -54,9 +63,20 @@ public abstract class Service<
 
             @Override
             public void enforceCallingPermission(String func) {
-                Service.this.enforceCallingPermission(func);
+                Service.this.enforceCallingCapability(func, SheveryApiConstants.CAP_SHELL_EXEC);
             }
         };
+    }
+
+    /**
+     * Confines an untrusted incoming Bundle to the framework ClassLoader so unparceling
+     * on API <= 32 cannot instantiate arbitrary classes from the server's classpath.
+     * Adapted from Porter API ({@code UntrustedBundles.kt}).
+     */
+    protected static void confineToFramework(@Nullable Bundle bundle) {
+        if (bundle != null) {
+            bundle.setClassLoader(Bundle.class.getClassLoader());
+        }
     }
 
     public abstract UserServiceMgr onCreateUserServiceManager();
@@ -94,8 +114,8 @@ public abstract class Service<
         }
 
         String msg = "Permission Denial: " + func + " from pid="
-                + Binder.getCallingPid()
-                + " is not manager ";
+                + callingPid
+                + " is not manager";
         LOGGER.w(msg);
         throw new SecurityException(msg);
     }
@@ -105,6 +125,10 @@ public abstract class Service<
     }
 
     public final void enforceCallingPermission(String func) {
+        enforceCallingCapability(func, 0);
+    }
+
+    public final void enforceCallingCapability(String func, int requiredCapability) {
         int callingUid = Binder.getCallingUid();
         int callingPid = Binder.getCallingPid();
 
@@ -120,7 +144,7 @@ public abstract class Service<
 
         if (clientRecord == null) {
             String msg = "Permission Denial: " + func + " from pid="
-                    + Binder.getCallingPid()
+                    + callingPid
                     + " is not an attached client";
             LOGGER.w(msg);
             throw new SecurityException(msg);
@@ -128,17 +152,41 @@ public abstract class Service<
 
         if (!clientRecord.allowed) {
             String msg = "Permission Denial: " + func + " from pid="
-                    + Binder.getCallingPid()
+                    + callingPid
                     + " requires permission";
+            LOGGER.w(msg);
+            throw new SecurityException(msg);
+        }
+
+        if (requiredCapability != 0
+                && clientRecord.capabilities != 0
+                && (clientRecord.capabilities & requiredCapability) == 0) {
+            String msg = "Permission Denial: " + func + " from pid="
+                    + callingPid
+                    + " lacks capability 0x" + Integer.toHexString(requiredCapability);
             LOGGER.w(msg);
             throw new SecurityException(msg);
         }
     }
 
     public final void transactRemote(Parcel data, Parcel reply, int flags) throws RemoteException {
-        enforceCallingPermission("transactRemote");
+        enforceCallingCapability("transactRemote", SheveryApiConstants.CAP_BINDER_PROXY);
 
         IBinder targetBinder = data.readStrongBinder();
+        if (targetBinder == null) {
+            throw new IllegalArgumentException("targetBinder must not be null");
+        }
+        // Prevent self-binder privilege escalation: a local Binder of this server process would run
+        // with the server's own PID/UID once clearCallingIdentity() is called below, bypassing
+        // enforceManagerPermission(). Adapted from Porter API (PorterCore.kt).
+        if (targetBinder instanceof Binder) {
+            String msg = "Permission Denial: transactRemote from pid="
+                    + Binder.getCallingPid()
+                    + " targets a binder of the server process";
+            LOGGER.w(msg);
+            throw new SecurityException(msg);
+        }
+
         int targetCode = data.readInt();
         int targetFlags;
 
@@ -152,18 +200,28 @@ public abstract class Service<
             targetFlags = flags;
         }
 
-        LOGGER.d("transact: uid=%d, descriptor=%s, code=%d", Binder.getCallingUid(), targetBinder.getInterfaceDescriptor(), targetCode);
+        String descriptor;
+        try {
+            descriptor = targetBinder.getInterfaceDescriptor();
+        } catch (Throwable tr) {
+            descriptor = "<unavailable>";
+        }
+        LOGGER.d("transact: uid=%d, descriptor=%s, code=%d", callingUid, descriptor, targetCode);
+
         Parcel newData = Parcel.obtain();
         try {
-            newData.appendFrom(data, data.dataPosition(), data.dataAvail());
-        } catch (Throwable tr) {
-            LOGGER.w(tr, "appendFrom");
-            return;
-        }
-        try {
+            try {
+                newData.appendFrom(data, data.dataPosition(), data.dataAvail());
+            } catch (Throwable tr) {
+                LOGGER.w(tr, "appendFrom");
+                return;
+            }
             long id = Binder.clearCallingIdentity();
-            targetBinder.transact(targetCode, newData, reply, targetFlags);
-            Binder.restoreCallingIdentity(id);
+            try {
+                targetBinder.transact(targetCode, newData, reply, targetFlags);
+            } finally {
+                Binder.restoreCallingIdentity(id);
+            }
         } finally {
             newData.recycle();
         }
@@ -184,6 +242,9 @@ public abstract class Service<
     @Override
     public final int checkPermission(String permission) throws RemoteException {
         enforceCallingPermission("checkPermission");
+        if (permission == null) {
+            throw new NullPointerException("permission is null");
+        }
         return PermissionManagerApis.checkPermission(permission, Os.getuid());
     }
 
@@ -200,7 +261,10 @@ public abstract class Service<
 
     @Override
     public final String getSystemProperty(String name, String defaultValue) {
-        enforceCallingPermission("getSystemProperty");
+        enforceCallingCapability("getSystemProperty", SheveryApiConstants.CAP_SYSTEM_PROPS);
+        if (name == null) {
+            throw new NullPointerException("name is null");
+        }
 
         try {
             return SystemProperties.get(name, defaultValue);
@@ -211,7 +275,10 @@ public abstract class Service<
 
     @Override
     public final void setSystemProperty(String name, String value) {
-        enforceCallingPermission("setSystemProperty");
+        enforceCallingCapability("setSystemProperty", SheveryApiConstants.CAP_SYSTEM_PROPS);
+        if (name == null) {
+            throw new NullPointerException("name is null");
+        }
 
         try {
             SystemProperties.set(name, value);
@@ -222,14 +289,23 @@ public abstract class Service<
 
     @Override
     public final int removeUserService(IShizukuServiceConnection conn, Bundle options) {
-        enforceCallingPermission("removeUserService");
+        enforceCallingCapability("removeUserService", SheveryApiConstants.CAP_USER_SERVICE);
+        if (options == null) {
+            throw new NullPointerException("options is null");
+        }
 
         return userServiceManager.removeUserService(conn, options);
     }
 
     @Override
     public final int addUserService(IShizukuServiceConnection conn, Bundle options) {
-        enforceCallingPermission("addUserService");
+        enforceCallingCapability("addUserService", SheveryApiConstants.CAP_USER_SERVICE);
+        if (conn == null) {
+            throw new NullPointerException("connection is null");
+        }
+        if (options == null) {
+            throw new NullPointerException("options is null");
+        }
 
         int callingUid = Binder.getCallingUid();
         int callingPid = Binder.getCallingPid();
@@ -246,6 +322,7 @@ public abstract class Service<
 
     @Override
     public void attachUserService(IBinder binder, Bundle options) {
+        confineToFramework(options);
         userServiceManager.attachUserService(binder, options);
     }
 
@@ -305,109 +382,22 @@ public abstract class Service<
         return entry != null && entry.isDenied();
     }
 
-    private static final String DEFAULT_PATH = "/data/local/tmp/shevery/bin:/product/bin:/apex/com.android.runtime/bin:/apex/com.android.art/bin:/system_ext/bin:/system/bin:/system/xbin:/odm/bin:/vendor/bin:/vendor/xbin:/sbin:/data/adb/apatch:/data/adb/ksu/bin";
-
-    private String[] translateAdbCommand(String[] cmd) {
-        if (cmd == null || cmd.length == 0) {
-            return cmd;
-        }
-
-        String program = cmd[0];
-        if (!"adb".equals(program) && !program.endsWith("/adb")) {
-            return cmd;
-        }
-
-        int index = 1;
-        while (index < cmd.length) {
-            String arg = cmd[index];
-            if ("-s".equals(arg) || "-H".equals(arg) || "-P".equals(arg) || "-L".equals(arg)) {
-                index += 2;
-            } else if ("-d".equals(arg) || "-e".equals(arg)) {
-                index += 1;
-            } else {
-                break;
-            }
-        }
-
-        if (index >= cmd.length) {
-            return new String[]{"/system/bin/sh"};
-        }
-
-        String sub = cmd[index];
-        if ("shell".equals(sub)) {
-            index++;
-            if (index >= cmd.length) {
-                return new String[]{"/system/bin/sh"};
-            }
-            StringBuilder sb = new StringBuilder();
-            for (int i = index; i < cmd.length; i++) {
-                if (i > index) sb.append(' ');
-                sb.append(cmd[i]);
-            }
-            return new String[]{"/system/bin/sh", "-c", sb.toString()};
-        } else if ("devices".equals(sub)) {
-            return new String[]{"/system/bin/sh", "-c", "echo 'List of devices attached\nshevery-device\tdevice'"};
-        } else if ("version".equals(sub)) {
-            return new String[]{"/system/bin/sh", "-c", "echo 'Android Debug Bridge version 1.0.41\nVersion shevery-server'"};
-        } else if ("get-state".equals(sub) || "get-serialno".equals(sub)) {
-            return new String[]{"/system/bin/sh", "-c", "echo 'shevery-device'"};
-        } else if ("wait-for-device".equals(sub)) {
-            return new String[]{"/system/bin/sh", "-c", "exit 0"};
-        } else if ("install".equals(sub)) {
-            StringBuilder sb = new StringBuilder("pm install");
-            for (int i = index + 1; i < cmd.length; i++) {
-                sb.append(' ').append(cmd[i]);
-            }
-            return new String[]{"/system/bin/sh", "-c", sb.toString()};
-        } else if ("uninstall".equals(sub)) {
-            StringBuilder sb = new StringBuilder("pm uninstall");
-            for (int i = index + 1; i < cmd.length; i++) {
-                sb.append(' ').append(cmd[i]);
-            }
-            return new String[]{"/system/bin/sh", "-c", sb.toString()};
-        } else if ("push".equals(sub) || "pull".equals(sub)) {
-            StringBuilder sb = new StringBuilder("cp -r");
-            for (int i = index + 1; i < cmd.length; i++) {
-                sb.append(' ').append(cmd[i]);
-            }
-            return new String[]{"/system/bin/sh", "-c", sb.toString()};
-        } else {
-            StringBuilder sb = new StringBuilder();
-            for (int i = index; i < cmd.length; i++) {
-                if (i > index) sb.append(' ');
-                sb.append(cmd[i]);
-            }
-            return new String[]{"/system/bin/sh", "-c", sb.toString()};
-        }
-    }
-
-    private String[] sanitizeEnvironment(String[] env) {
-        Map<String, String> map = new LinkedHashMap<>();
+    @Nullable
+    private String[] normalizeEnvironment(@Nullable String[] env) {
         if (env == null) {
-            map.putAll(System.getenv());
-        } else {
-            for (String entry : env) {
-                if (entry == null) continue;
-                int eq = entry.indexOf('=');
-                if (eq > 0) {
-                    map.put(entry.substring(0, eq), entry.substring(eq + 1));
-                }
+            return null;
+        }
+        Map<String, String> map = new LinkedHashMap<>(System.getenv());
+        for (String entry : env) {
+            if (entry == null) continue;
+            int eq = entry.indexOf('=');
+            if (eq > 0) {
+                map.put(entry.substring(0, eq), entry.substring(eq + 1));
             }
         }
         String path = map.get("PATH");
         if (path == null || path.isEmpty()) {
             map.put("PATH", DEFAULT_PATH);
-        } else if (!path.contains("/data/local/tmp/shevery/bin")) {
-            map.put("PATH", "/data/local/tmp/shevery/bin:" + path);
-        }
-        if (!map.containsKey("AXERON")) {
-            map.put("AXERON", "true");
-        }
-        if (!map.containsKey("AXERONVER")) {
-            map.put("AXERONVER", "1.0.0");
-        }
-        if (!map.containsKey("ASH_STANDALONE")) {
-            map.put("ASH_STANDALONE", "1");
         }
         String[] result = new String[map.size()];
         int i = 0;
@@ -419,33 +409,131 @@ public abstract class Service<
 
     @Override
     public final IRemoteProcess newProcess(String[] cmd, String[] env, String dir) {
-        enforceCallingPermission("newProcess");
-
-        String[] finalCmd = translateAdbCommand(cmd);
-        String[] finalEnv = sanitizeEnvironment(env);
-        File workingDir = null;
-        if (dir != null) {
-            File d = new File(dir);
-            if (d.isDirectory() && d.canRead() && d.canExecute()) {
-                workingDir = d;
-            } else {
-                workingDir = new File("/data/local/tmp");
-            }
+        enforceCallingCapability("newProcess", SheveryApiConstants.CAP_SHELL_EXEC);
+        if (cmd == null || cmd.length == 0) {
+            throw new IllegalArgumentException("cmd must not be null or empty");
         }
 
-        LOGGER.d("newProcess: uid=%d, cmd=%s, env=%s, dir=%s", Binder.getCallingUid(), Arrays.toString(finalCmd), Arrays.toString(finalEnv), workingDir);
+        String[] finalEnv = normalizeEnvironment(env);
+        File workingDir = dir != null ? new File(dir) : null;
+
+        LOGGER.d("newProcess: uid=%d, cmd=%s, env=%s, dir=%s",
+                Binder.getCallingUid(), Arrays.toString(cmd), Arrays.toString(finalEnv), dir);
 
         java.lang.Process process;
         try {
-            process = Runtime.getRuntime().exec(finalCmd, finalEnv, workingDir);
+            process = Runtime.getRuntime().exec(cmd, finalEnv, workingDir);
         } catch (IOException e) {
             throw new IllegalStateException(e.getMessage());
         }
 
         ClientRecord clientRecord = clientManager.findClient(Binder.getCallingUid(), Binder.getCallingPid());
-        IBinder token = clientRecord != null ? clientRecord.client.asBinder() : null;
+        IBinder token = clientRecord != null && clientRecord.client != null ? clientRecord.client.asBinder() : null;
 
         return new RemoteProcessHolder(process, token);
+    }
+
+    /**
+     * Fast one-shot command execution over flat Parcel IPC with bounded output and timeout.
+     * Adapted from Nightzuku API ({@code NightClient.execFast}).
+     */
+    protected final void execFast(@NonNull Parcel data, @Nullable Parcel reply) {
+        enforceCallingCapability("execFast", SheveryApiConstants.CAP_SHELL_EXEC);
+
+        String[] cmd = data.createStringArray();
+        String[] env = data.createStringArray();
+        String dir = data.readString();
+        long timeoutMs = data.readLong();
+
+        if (cmd == null || cmd.length == 0) {
+            throw new IllegalArgumentException("cmd must not be null or empty");
+        }
+        if (timeoutMs <= 0) {
+            timeoutMs = SheveryApiConstants.EXEC_FAST_DEFAULT_TIMEOUT_MS;
+        }
+
+        String[] finalEnv = normalizeEnvironment(env);
+        File workingDir = dir != null ? new File(dir) : null;
+
+        java.lang.Process process;
+        try {
+            process = Runtime.getRuntime().exec(cmd, finalEnv, workingDir);
+        } catch (IOException e) {
+            throw new IllegalStateException(e.getMessage());
+        }
+
+        try {
+            process.getOutputStream().close();
+        } catch (IOException ignored) {
+        }
+
+        final ByteArrayOutputStream stdoutBuf = new ByteArrayOutputStream();
+        final ByteArrayOutputStream stderrBuf = new ByteArrayOutputStream();
+
+        Thread outReader = new Thread(() -> drainBounded(process.getInputStream(), stdoutBuf), "shevery-exec-out");
+        Thread errReader = new Thread(() -> drainBounded(process.getErrorStream(), stderrBuf), "shevery-exec-err");
+        outReader.setDaemon(true);
+        errReader.setDaemon(true);
+        outReader.start();
+        errReader.start();
+
+        boolean timedOut = false;
+        int exitCode = -1;
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                if (!process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)) {
+                    timedOut = true;
+                    process.destroyForcibly();
+                } else {
+                    exitCode = process.exitValue();
+                }
+            } else {
+                long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+                while (true) {
+                    try {
+                        exitCode = process.exitValue();
+                        break;
+                    } catch (IllegalThreadStateException ex) {
+                        if (System.nanoTime() >= deadline) {
+                            timedOut = true;
+                            process.destroy();
+                            break;
+                        }
+                        Thread.sleep(25);
+                    }
+                }
+            }
+            outReader.join(1000);
+            errReader.join(1000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            process.destroy();
+            throw new IllegalStateException("Interrupted while waiting for process", e);
+        }
+
+        if (reply != null) {
+            reply.writeNoException();
+            reply.writeInt(exitCode);
+            reply.writeInt(timedOut ? 1 : 0);
+            reply.writeByteArray(stdoutBuf.toByteArray());
+            reply.writeByteArray(stderrBuf.toByteArray());
+        }
+    }
+
+    private static void drainBounded(@NonNull InputStream in, @NonNull ByteArrayOutputStream out) {
+        byte[] buf = new byte[8192];
+        int remaining = SheveryApiConstants.EXEC_FAST_MAX_OUTPUT_BYTES;
+        try (InputStream stream = in) {
+            int n;
+            while ((n = stream.read(buf)) > 0) {
+                int toWrite = Math.min(n, remaining);
+                if (toWrite > 0) {
+                    out.write(buf, 0, toWrite);
+                    remaining -= toWrite;
+                }
+            }
+        } catch (IOException ignored) {
+        }
     }
 
     @CallSuper
@@ -455,6 +543,10 @@ public abstract class Service<
             data.enforceInterface(ShizukuApiConstants.BINDER_DESCRIPTOR);
             transactRemote(data, reply, flags);
             return true;
+        } else if (code == SheveryApiConstants.BINDER_TRANSACTION_execFast) {
+            data.enforceInterface(SheveryApiConstants.BINDER_DESCRIPTOR);
+            execFast(data, reply);
+            return true;
         } else if (code == 14 /* attachApplication <= v12 */) {
             data.enforceInterface(ShizukuApiConstants.BINDER_DESCRIPTOR);
             IBinder binder = data.readStrongBinder();
@@ -463,7 +555,9 @@ public abstract class Service<
             args.putString(ShizukuApiConstants.ATTACH_APPLICATION_PACKAGE_NAME, packageName);
             args.putInt(ShizukuApiConstants.ATTACH_APPLICATION_API_VERSION, -1);
             attachApplication(IShizukuApplication.Stub.asInterface(binder), args);
-            reply.writeNoException();
+            if (reply != null) {
+                reply.writeNoException();
+            }
             return true;
         } else if (rishService.onTransact(code, data, reply, flags)) {
             return true;
