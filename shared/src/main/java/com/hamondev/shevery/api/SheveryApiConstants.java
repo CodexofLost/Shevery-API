@@ -17,11 +17,25 @@ public final class SheveryApiConstants {
     }
 
     public static final int SERVER_VERSION = 14;
-    public static final int SERVER_PATCH_VERSION = 5;
+    public static final int SERVER_PATCH_VERSION = 6;
 
-    // Binder interface
+    // Binder interface & custom transactions
     public static final String BINDER_DESCRIPTOR = "moe.shizuku.server.IShizukuService";
     public static final int BINDER_TRANSACTION_transact = 1;
+    public static final int BINDER_TRANSACTION_execFast = 20001;
+
+    // Bounds for fast one-shot command execution (adapted from Nightzuku API)
+    public static final int EXEC_FAST_MAX_OUTPUT_BYTES = 256 * 1024;
+    public static final long EXEC_FAST_DEFAULT_TIMEOUT_MS = 30_000L;
+
+    // Fine-grained capability bitmasks stored in upper bits of ConfigManager flags (adapted from Nightzuku API)
+    public static final int CAP_SHELL_EXEC = 1 << 8;
+    public static final int CAP_BINDER_PROXY = 1 << 9;
+    public static final int CAP_USER_SERVICE = 1 << 10;
+    public static final int CAP_SYSTEM_PROPS = 1 << 11;
+    public static final int MASK_CAPABILITIES =
+            CAP_SHELL_EXEC | CAP_BINDER_PROXY | CAP_USER_SERVICE | CAP_SYSTEM_PROPS;
+    public static final int DEFAULT_CAPABILITIES = MASK_CAPABILITIES;
 
     // Package identifiers
     public static final String MANAGER_APPLICATION_ID = "com.hamondev.shevery";
@@ -63,8 +77,10 @@ public final class SheveryApiConstants {
     public static final String ACTION_REQUEST_PERMISSION = "com.hamondev.shevery.intent.action.REQUEST_PERMISSION";
     public static final String ACTION_REQUEST_BINDER = "com.hamondev.shevery.intent.action.REQUEST_BINDER";
 
-    // Attach application channel negotiation
+    // Attach application channel & capability negotiation
     public static final String ATTACH_APPLICATION_CLIENT_CHANNEL = "shevery:attach-client-channel";
+    public static final String BIND_APPLICATION_CAPABILITIES = "shevery:attach-reply-capabilities";
+    public static final String REQUEST_PERMISSION_REPLY_CAPABILITIES = "shevery:request-permission-reply-capabilities";
     public static final String CHANNEL_SHEVERY_NATIVE = "shevery_native";
     public static final String CHANNEL_SHIZUKU_STUB = "shizuku_stub";
 
