@@ -22,9 +22,9 @@ import moe.shizuku.api.BinderContainer;
 /**
  * Native ContentProvider for the Shevery Privilege API ({@code ${applicationId}.shevery}).
  * <p>
- * Unlike the legacy {@code ShizukuProvider}, {@code SheveryProvider} supports both
- * proactive fast-pull binder acquisition on startup ({@link SheveryPrivilege#connectFast(Context)})
- * and low-latency server push delivery under {@link SheveryApiConstants#PERMISSION_PRIVILEGED_API}.
+ * Supports proactive fast-pull binder acquisition on startup ({@link SheveryPrivilege#connectFast(Context)}),
+ * zero-stub {@link LegacyParcelCodec} extraction (adapted from Nightzuku API), and low-latency
+ * server push delivery under {@link SheveryApiConstants#PERMISSION_PRIVILEGED_API}.
  */
 public class SheveryProvider extends ContentProvider {
 
@@ -39,14 +39,14 @@ public class SheveryProvider extends ContentProvider {
 
     private static volatile boolean enableMultiProcess = false;
     private static volatile boolean isProviderProcess = false;
-    private static BroadcastReceiver multiProcessReceiver;
+    private static volatile BroadcastReceiver multiProcessReceiver;
 
     public static void enableMultiProcessSupport(boolean isProviderProcess) {
         SheveryProvider.isProviderProcess = isProviderProcess;
         SheveryProvider.enableMultiProcess = true;
     }
 
-    public static void requestBinderForNonProviderProcess(@NonNull Context context) {
+    public static synchronized void requestBinderForNonProviderProcess(@NonNull Context context) {
         if (isProviderProcess) {
             return;
         }
@@ -54,13 +54,19 @@ public class SheveryProvider extends ContentProvider {
             multiProcessReceiver = new BroadcastReceiver() {
                 @Override
                 public void onReceive(Context ctx, Intent intent) {
-                    intent.setExtrasClassLoader(BinderContainer.class.getClassLoader());
-                    BinderContainer container = intent.getParcelableExtra(SheveryApiConstants.EXTRA_BINDER);
-                    if (container == null) {
-                        container = intent.getParcelableExtra(SheveryApiConstants.LEGACY_EXTRA_BINDER);
+                    IBinder extracted = LegacyParcelCodec.extractBinderFromBundle(intent.getExtras());
+                    if (extracted == null) {
+                        intent.setExtrasClassLoader(BinderContainer.class.getClassLoader());
+                        BinderContainer container = intent.getParcelableExtra(SheveryApiConstants.EXTRA_BINDER);
+                        if (container == null) {
+                            container = intent.getParcelableExtra(SheveryApiConstants.LEGACY_EXTRA_BINDER);
+                        }
+                        if (container != null) {
+                            extracted = container.binder;
+                        }
                     }
-                    if (container != null && container.binder != null) {
-                        SheveryPrivilege.onBinderReceived(container.binder, ctx.getPackageName());
+                    if (extracted != null) {
+                        SheveryPrivilege.onBinderReceived(extracted, ctx.getPackageName());
                     }
                 }
             };
@@ -84,10 +90,16 @@ public class SheveryProvider extends ContentProvider {
                     new Bundle()
             );
             if (reply != null) {
-                reply.setClassLoader(BinderContainer.class.getClassLoader());
-                BinderContainer container = reply.getParcelable(SheveryApiConstants.EXTRA_BINDER);
-                if (container != null && container.binder != null) {
-                    SheveryPrivilege.onBinderReceived(container.binder, context.getPackageName());
+                IBinder extracted = LegacyParcelCodec.extractBinderFromBundle(reply);
+                if (extracted == null) {
+                    reply.setClassLoader(BinderContainer.class.getClassLoader());
+                    BinderContainer container = reply.getParcelable(SheveryApiConstants.EXTRA_BINDER);
+                    if (container != null) {
+                        extracted = container.binder;
+                    }
+                }
+                if (extracted != null) {
+                    SheveryPrivilege.onBinderReceived(extracted, context.getPackageName());
                 }
             }
         } catch (Throwable ignored) {
@@ -110,7 +122,6 @@ public class SheveryProvider extends ContentProvider {
     public boolean onCreate() {
         final Context ctx = getContext();
         if (ctx != null && !MANAGER_APPLICATION_ID.equals(ctx.getPackageName())) {
-            // Non-blocking fast pull from Shevery Manager if already running
             try {
                 SheveryPrivilege.connectFast(ctx);
             } catch (Throwable ignored) {
@@ -125,7 +136,6 @@ public class SheveryProvider extends ContentProvider {
         if (extras == null) {
             extras = new Bundle();
         }
-        extras.setClassLoader(BinderContainer.class.getClassLoader());
 
         Bundle reply = new Bundle();
         switch (method) {
@@ -150,16 +160,24 @@ public class SheveryProvider extends ContentProvider {
         if (SheveryPrivilege.pingBinder()) {
             return;
         }
-        BinderContainer container = extras.getParcelable(SheveryApiConstants.EXTRA_BINDER);
-        if (container == null) {
-            container = extras.getParcelable(SheveryApiConstants.LEGACY_EXTRA_BINDER);
+        IBinder receivedBinder = LegacyParcelCodec.extractBinderFromBundle(extras);
+        if (receivedBinder == null) {
+            extras.setClassLoader(BinderContainer.class.getClassLoader());
+            BinderContainer container = extras.getParcelable(SheveryApiConstants.EXTRA_BINDER);
+            if (container == null) {
+                container = extras.getParcelable(SheveryApiConstants.LEGACY_EXTRA_BINDER);
+            }
+            if (container != null) {
+                receivedBinder = container.binder;
+            }
         }
         Context ctx = getContext();
-        if (container != null && container.binder != null && ctx != null) {
+        if (receivedBinder != null && ctx != null) {
             Log.d(TAG, "Native Shevery binder received for " + ctx.getPackageName());
-            SheveryPrivilege.onBinderReceived(container.binder, ctx.getPackageName());
+            SheveryPrivilege.onBinderReceived(receivedBinder, ctx.getPackageName());
 
             if (enableMultiProcess) {
+                BinderContainer container = new BinderContainer(receivedBinder);
                 Intent intent = new Intent(ACTION_BINDER_RECEIVED)
                         .putExtra(SheveryApiConstants.EXTRA_BINDER, container)
                         .setPackage(ctx.getPackageName());

@@ -28,6 +28,8 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.annotation.RestrictTo;
 
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.Objects;
 import java.util.concurrent.CopyOnWriteArraySet;
 
@@ -41,15 +43,19 @@ import rikka.shizuku.SystemServiceHelper;
 /**
  * Native, low-latency Privilege API for Shevery ({@code com.hamondev.shevery.permission.PRIVILEGED_API}).
  * <p>
- * Key improvements over legacy Shizuku API:
+ * Key features and improvements:
  * <ul>
  *     <li><b>Fast Pull Acquisition ({@link #connectFast(Context)})</b>: Directly pulls the active
  *     server binder from Shevery's provider in a single IPC call without waiting for
  *     {@code IActivityManager} process/UID observers or retry backoffs.</li>
+ *     <li><b>One-Shot Fast Execution ({@link #execFast(String[], String[], String, long)})</b>:
+ *     Executes short-lived commands over a single flat Parcel transaction with bounded output
+ *     ({@link SheveryApiConstants#EXEC_FAST_MAX_OUTPUT_BYTES}) and timeout control (adapted from Nightzuku API).</li>
+ *     <li><b>Fine-Grained Capability Inspection ({@link #hasCapability(int)})</b>: Supports checking
+ *     capability bitmasks ({@code CAP_SHELL_EXEC}, {@code CAP_BINDER_PROXY}, {@code CAP_USER_SERVICE},
+ *     {@code CAP_SYSTEM_PROPS}) adapted from Nightzuku API.</li>
  *     <li><b>Lock-Free Listener Dispatch</b>: Uses {@link CopyOnWriteArraySet} for binder and
  *     permission callbacks instead of a single contended global lock.</li>
- *     <li><b>Dedicated Permission Scope</b>: Operates under {@link SheveryApiConstants#PERMISSION_PRIVILEGED_API},
- *     leaving {@code moe.shizuku.manager.permission.API_V23} isolated to the Shizuku Stub.</li>
  * </ul>
  */
 public final class SheveryPrivilege {
@@ -66,7 +72,57 @@ public final class SheveryPrivilege {
     private static volatile String serverContext = null;
     private static volatile boolean permissionGranted = false;
     private static volatile boolean shouldShowRequestPermissionRationale = false;
+    private static volatile int capabilitiesMask = 0;
     private static volatile boolean binderReady = false;
+
+    /**
+     * Result of a one-shot command executed via {@link #execFast(String[], String[], String, long)}.
+     * Adapted from Nightzuku API ({@code NightClient.ExecResult}).
+     */
+    public static final class ExecResult {
+        public final int exitCode;
+        public final boolean timedOut;
+        @NonNull
+        public final byte[] stdout;
+        @NonNull
+        public final byte[] stderr;
+
+        public ExecResult(int exitCode, boolean timedOut, @Nullable byte[] stdout, @Nullable byte[] stderr) {
+            this.exitCode = exitCode;
+            this.timedOut = timedOut;
+            this.stdout = stdout != null ? stdout : new byte[0];
+            this.stderr = stderr != null ? stderr : new byte[0];
+        }
+
+        @NonNull
+        public String getOutputText() {
+            return new String(stdout, StandardCharsets.UTF_8);
+        }
+
+        @NonNull
+        public String getErrorText() {
+            return new String(stderr, StandardCharsets.UTF_8);
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof ExecResult)) return false;
+            ExecResult that = (ExecResult) o;
+            return exitCode == that.exitCode
+                    && timedOut == that.timedOut
+                    && Arrays.equals(stdout, that.stdout)
+                    && Arrays.equals(stderr, that.stderr);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Objects.hash(exitCode, timedOut);
+            result = 31 * result + Arrays.hashCode(stdout);
+            result = 31 * result + Arrays.hashCode(stderr);
+            return result;
+        }
+    }
 
     public interface OnBinderReceivedListener {
         void onBinderReceived();
@@ -112,12 +168,17 @@ public final class SheveryPrivilege {
 
         @Override
         public void bindApplication(Bundle data) {
+            if (data == null) {
+                return;
+            }
             serverUid = data.getInt(BIND_APPLICATION_SERVER_UID, -1);
             serverApiVersion = data.getInt(BIND_APPLICATION_SERVER_VERSION, -1);
             serverPatchVersion = data.getInt(BIND_APPLICATION_SERVER_PATCH_VERSION, -1);
             serverContext = data.getString(BIND_APPLICATION_SERVER_SECONTEXT);
             permissionGranted = data.getBoolean(BIND_APPLICATION_PERMISSION_GRANTED, false);
             shouldShowRequestPermissionRationale = data.getBoolean(BIND_APPLICATION_SHOULD_SHOW_REQUEST_PERMISSION_RATIONALE, false);
+            int defaultCaps = permissionGranted ? SheveryApiConstants.DEFAULT_CAPABILITIES : 0;
+            capabilitiesMask = data.getInt(SheveryApiConstants.BIND_APPLICATION_CAPABILITIES, defaultCaps);
 
             binderReady = true;
             Shizuku.syncFromShevery(
@@ -138,6 +199,12 @@ public final class SheveryPrivilege {
             permissionGranted = allowed;
             if (allowed) {
                 shouldShowRequestPermissionRationale = false;
+                capabilitiesMask = data.getInt(
+                        SheveryApiConstants.REQUEST_PERMISSION_REPLY_CAPABILITIES,
+                        SheveryApiConstants.DEFAULT_CAPABILITIES
+                );
+            } else {
+                capabilitiesMask = 0;
             }
             int result = allowed ? PackageManager.PERMISSION_GRANTED : PackageManager.PERMISSION_DENIED;
             Shizuku.syncPermissionResultFromShevery(requestCode, allowed);
@@ -187,13 +254,19 @@ public final class SheveryPrivilege {
                         extras
                 );
                 if (reply != null) {
-                    reply.setClassLoader(BinderContainer.class.getClassLoader());
-                    BinderContainer container = reply.getParcelable(SheveryApiConstants.EXTRA_BINDER);
-                    if (container == null) {
-                        container = reply.getParcelable(SheveryApiConstants.LEGACY_EXTRA_BINDER);
+                    IBinder extracted = LegacyParcelCodec.extractBinderFromBundle(reply);
+                    if (extracted == null) {
+                        reply.setClassLoader(BinderContainer.class.getClassLoader());
+                        BinderContainer container = reply.getParcelable(SheveryApiConstants.EXTRA_BINDER);
+                        if (container == null) {
+                            container = reply.getParcelable(SheveryApiConstants.LEGACY_EXTRA_BINDER);
+                        }
+                        if (container != null) {
+                            extracted = container.binder;
+                        }
                     }
-                    if (container != null && container.binder != null && container.binder.pingBinder()) {
-                        onBinderReceived(container.binder, pkg);
+                    if (extracted != null && extracted.pingBinder()) {
+                        onBinderReceived(extracted, pkg);
                         return true;
                     }
                 }
@@ -246,6 +319,8 @@ public final class SheveryPrivilege {
             serverPatchVersion = -1;
             serverContext = null;
             permissionGranted = false;
+            shouldShowRequestPermissionRationale = false;
+            capabilitiesMask = 0;
             binderReady = false;
 
             dispatchBinderDead();
@@ -282,7 +357,7 @@ public final class SheveryPrivilege {
      * avoiding a duplicate {@code attachApplication} Binder transaction.
      */
     @RestrictTo(LIBRARY_GROUP_PREFIX)
-    public static void syncFromShizuku(
+    public static synchronized void syncFromShizuku(
             @Nullable IBinder newBinder,
             int uid,
             int apiVer,
@@ -299,6 +374,7 @@ public final class SheveryPrivilege {
         serverContext = seContext;
         permissionGranted = granted;
         shouldShowRequestPermissionRationale = showRationale;
+        capabilitiesMask = granted ? SheveryApiConstants.DEFAULT_CAPABILITIES : 0;
         binderReady = newBinder != null && newBinder.pingBinder();
         if (binderReady) {
             dispatchBinderReceived();
@@ -312,6 +388,11 @@ public final class SheveryPrivilege {
         permissionGranted = allowed;
         if (allowed) {
             shouldShowRequestPermissionRationale = false;
+            if (capabilitiesMask == 0) {
+                capabilitiesMask = SheveryApiConstants.DEFAULT_CAPABILITIES;
+            }
+        } else {
+            capabilitiesMask = 0;
         }
         dispatchPermissionResult(
                 requestCode,
@@ -426,6 +507,22 @@ public final class SheveryPrivilege {
         return current != null && current.pingBinder();
     }
 
+    /**
+     * Returns the current fine-grained capability bitmask granted to this client.
+     * Adapted from Nightzuku API ({@code NightClient.getCapabilities()}).
+     */
+    public static int getCapabilities() {
+        return capabilitiesMask;
+    }
+
+    /**
+     * Checks whether a specific capability bitmask (e.g. {@link SheveryApiConstants#CAP_SHELL_EXEC})
+     * is granted to this client. Adapted from Nightzuku API ({@code NightClient.hasCapability(int)}).
+     */
+    public static boolean hasCapability(int capabilityFlag) {
+        return (capabilitiesMask & capabilityFlag) != 0;
+    }
+
     @NonNull
     public static SheveryBinderWrapper wrapBinder(@NonNull IBinder original) {
         return new SheveryBinderWrapper(original);
@@ -451,6 +548,56 @@ public final class SheveryPrivilege {
             return new SheveryRemoteProcess(requireService().newProcess(cmd, env, dir));
         } catch (RemoteException e) {
             throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * Executes a short-lived command in a single flat Parcel transaction with default timeout (30s)
+     * and bounded output ({@link SheveryApiConstants#EXEC_FAST_MAX_OUTPUT_BYTES}).
+     * Adapted from Nightzuku API ({@code NightClient.execFast}).
+     */
+    @NonNull
+    public static ExecResult execFast(@NonNull String[] cmd) {
+        return execFast(cmd, null, null, SheveryApiConstants.EXEC_FAST_DEFAULT_TIMEOUT_MS);
+    }
+
+    /**
+     * Executes a short-lived command in a single flat Parcel transaction with bounded output
+     * ({@link SheveryApiConstants#EXEC_FAST_MAX_OUTPUT_BYTES}) and explicit timeout.
+     * Adapted from Nightzuku API ({@code NightClient.execFast}).
+     */
+    @NonNull
+    public static ExecResult execFast(
+            @NonNull String[] cmd,
+            @Nullable String[] env,
+            @Nullable String dir,
+            long timeoutMs
+    ) {
+        Objects.requireNonNull(cmd, "cmd must not be null");
+        if (cmd.length == 0) {
+            throw new IllegalArgumentException("cmd must not be empty");
+        }
+        IBinder current = requireService().asBinder();
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(SheveryApiConstants.BINDER_DESCRIPTOR);
+            data.writeStringArray(cmd);
+            data.writeStringArray(env);
+            data.writeString(dir);
+            data.writeLong(timeoutMs);
+            current.transact(SheveryApiConstants.BINDER_TRANSACTION_execFast, data, reply, 0);
+            reply.readException();
+            int exitCode = reply.readInt();
+            boolean timedOut = reply.readInt() != 0;
+            byte[] stdout = reply.createByteArray();
+            byte[] stderr = reply.createByteArray();
+            return new ExecResult(exitCode, timedOut, stdout, stderr);
+        } catch (RemoteException e) {
+            throw new RuntimeException(e);
+        } finally {
+            reply.recycle();
+            data.recycle();
         }
     }
 
@@ -490,6 +637,11 @@ public final class SheveryPrivilege {
 
         public UserServiceArgs processNameSuffix(@NonNull String processNameSuffix) {
             this.processName = Objects.requireNonNull(processNameSuffix, "processNameSuffix must not be null");
+            return this;
+        }
+
+        public UserServiceArgs use32BitAppProcess(boolean use32BitAppProcess) {
+            this.use32BitAppProcess = use32BitAppProcess;
             return this;
         }
 
@@ -569,6 +721,9 @@ public final class SheveryPrivilege {
         }
         try {
             permissionGranted = requireService().checkSelfPermission();
+            if (permissionGranted && capabilitiesMask == 0) {
+                capabilitiesMask = SheveryApiConstants.DEFAULT_CAPABILITIES;
+            }
             return permissionGranted ? PackageManager.PERMISSION_GRANTED : PackageManager.PERMISSION_DENIED;
         } catch (RemoteException e) {
             throw new RuntimeException(e);
