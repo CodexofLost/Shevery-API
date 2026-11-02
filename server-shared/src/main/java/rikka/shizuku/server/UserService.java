@@ -21,9 +21,17 @@ import java.lang.reflect.Method;
 
 import dev.rikka.tools.refine.Refine;
 
+/**
+ * Bootstrapper for privileged UserService processes running under {@code app_process}.
+ * <p>
+ * Incorporates {@code ActivityThread$AppBindData} initialization from Nightzuku API
+ * ({@code kerneldroid/nightzuku-api}) so {@code Application.onCreate()} has valid
+ * bound application metadata on modern Android releases, while preserving the Context
+ * fallback for OEM ROM quirks.
+ */
 public class UserService {
 
-    private static String TAG;
+    private static String TAG = "UserService";
 
     public static void setTag(String tag) {
         UserService.TAG = tag;
@@ -47,8 +55,16 @@ public class UserService {
             } else if (arg.startsWith("--class=")) {
                 cls = arg.substring(8);
             } else if (arg.startsWith("--uid=")) {
-                uid = Integer.parseInt(arg.substring(6));
+                try {
+                    uid = Integer.parseInt(arg.substring(6));
+                } catch (NumberFormatException ignored) {
+                    uid = -1;
+                }
             }
+        }
+
+        if (pkg == null || cls == null || token == null) {
+            return null;
         }
 
         int userId = uid / 100000;
@@ -61,28 +77,66 @@ public class UserService {
             ActivityThread activityThread = ActivityThread.systemMain();
             Context systemContext = activityThread.getSystemContext();
 
-            DdmHandleAppName.setAppName(name != null ? name : pkg + ":user_service", userId);
+            String processName = name != null ? name : pkg + ":user_service";
+            DdmHandleAppName.setAppName(processName, userId);
 
             //noinspection InstantiationOfUtilityClass
             UserHandle userHandle = Refine.unsafeCast(
                     Build.VERSION.SDK_INT >= Build.VERSION_CODES.N
                             ? UserHandleHidden.of(userId)
                             : new UserHandleHidden(userId));
-            Context context = Refine.<ContextHidden>unsafeCast(systemContext).createPackageContextAsUser(pkg, Context.CONTEXT_INCLUDE_CODE | Context.CONTEXT_IGNORE_SECURITY, userHandle);
+            Context context = Refine.<ContextHidden>unsafeCast(systemContext).createPackageContextAsUser(
+                    pkg, Context.CONTEXT_INCLUDE_CODE | Context.CONTEXT_IGNORE_SECURITY, userHandle);
 
             Application application = null;
             try {
                 Field mPackageInfo = context.getClass().getDeclaredField("mPackageInfo");
                 mPackageInfo.setAccessible(true);
                 Object loadedApk = mPackageInfo.get(context);
-                Method makeApplication = loadedApk.getClass().getDeclaredMethod("makeApplication", boolean.class, Instrumentation.class);
+
+                // Populate ActivityThread$AppBindData before makeApplication (from Nightzuku API)
+                try {
+                    Class<?> appBindDataClass = Class.forName("android.app.ActivityThread$AppBindData");
+                    Constructor<?> appBindDataCtor = appBindDataClass.getDeclaredConstructor();
+                    appBindDataCtor.setAccessible(true);
+                    Object appBindData = appBindDataCtor.newInstance();
+
+                    setAppBindDataField(appBindDataClass, appBindData, "processName", processName);
+
+                    Object appInfo = null;
+                    try {
+                        appInfo = loadedApk.getClass().getMethod("getApplicationInfo").invoke(loadedApk);
+                    } catch (Throwable ignored) {
+                        try {
+                            Field mAppInfo = loadedApk.getClass().getDeclaredField("mApplicationInfo");
+                            mAppInfo.setAccessible(true);
+                            appInfo = mAppInfo.get(loadedApk);
+                        } catch (Throwable ignored2) {
+                        }
+                    }
+                    setAppBindDataField(appBindDataClass, appBindData, "appInfo", appInfo);
+
+                    try {
+                        Object compatInfo = Class.forName("android.content.res.CompatibilityInfo")
+                                .getField("DEFAULT_COMPATIBILITY_INFO")
+                                .get(null);
+                        setAppBindDataField(appBindDataClass, appBindData, "compatInfo", compatInfo);
+                    } catch (Throwable ignored) {
+                    }
+
+                    Field mBoundApplication = activityThread.getClass().getDeclaredField("mBoundApplication");
+                    mBoundApplication.setAccessible(true);
+                    mBoundApplication.set(activityThread, appBindData);
+                } catch (Throwable ignored) {
+                }
+
+                Method makeApplication = loadedApk.getClass().getDeclaredMethod(
+                        "makeApplication", boolean.class, Instrumentation.class);
                 application = (Application) makeApplication.invoke(loadedApk, true, null);
                 Field mInitialApplication = activityThread.getClass().getDeclaredField("mInitialApplication");
                 mInitialApplication.setAccessible(true);
                 mInitialApplication.set(activityThread, application);
             } catch (Throwable e) {
-                // Catch any errors initializing the application, and use the old Context method as a fallback instead
-                // Especially relevant for MediaTek devices, see GitHub issue 1171
                 Log.w(TAG, "Failed to initialize Application, using Context as fallback", e);
                 application = null;
             }
@@ -97,7 +151,9 @@ public class UserService {
             if (constructorWithContext != null) {
                 service = (IBinder) constructorWithContext.newInstance(application != null ? application : context);
             } else {
-                service = (IBinder) serviceClass.newInstance();
+                Constructor<?> defaultCtor = serviceClass.getDeclaredConstructor();
+                defaultCtor.setAccessible(true);
+                service = (IBinder) defaultCtor.newInstance();
             }
         } catch (Throwable tr) {
             Log.w(TAG, String.format("unable to start service %s/%s...", pkg, cls), tr);
@@ -105,5 +161,16 @@ public class UserService {
         }
 
         return new Pair<>(service, token);
+    }
+
+    private static void setAppBindDataField(
+            Class<?> appBindDataClass, Object appBindData, String fieldName, @Nullable Object value) {
+        if (value == null) return;
+        try {
+            Field field = appBindDataClass.getDeclaredField(fieldName);
+            field.setAccessible(true);
+            field.set(appBindData, value);
+        } catch (Throwable ignored) {
+        }
     }
 }

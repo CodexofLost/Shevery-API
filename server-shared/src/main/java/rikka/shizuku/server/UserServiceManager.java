@@ -21,8 +21,10 @@ import android.text.format.DateUtils;
 import android.util.ArrayMap;
 
 import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -39,12 +41,18 @@ import rikka.shizuku.server.util.UserHandleCompat;
 public abstract class UserServiceManager {
 
     protected static final Logger LOGGER = new Logger("UserServiceManager");
+    private static final int MAX_SPAWN_RETRIES = 3;
 
     private final Executor executor = Executors.newSingleThreadExecutor();
     private final Map<String, UserServiceRecord> userServiceRecords = Collections.synchronizedMap(new ArrayMap<>());
     private final Map<String, List<UserServiceRecord>> packageUserServiceRecords = Collections.synchronizedMap(new ArrayMap<>());
 
     public UserServiceManager() {
+    }
+
+    private static String buildRecordKey(int userId, String packageName, String tagOrClass) {
+        // Multi-user key isolation adapted from Porter API (UserServiceOptions.key(userId))
+        return userId + ":" + packageName + ":" + tagOrClass;
     }
 
     public PackageInfo ensureCallingPackageForUserService(String packageName, int appId, int userId) {
@@ -61,6 +69,8 @@ public abstract class UserServiceManager {
     }
 
     public int removeUserService(IShizukuServiceConnection conn, Bundle options) {
+        Objects.requireNonNull(options, "options is null");
+        options.setClassLoader(ComponentName.class.getClassLoader());
         ComponentName componentName = Objects.requireNonNull(options.getParcelable(USER_SERVICE_ARG_COMPONENT), "component is null");
 
         int uid = Binder.getCallingUid();
@@ -72,7 +82,7 @@ public abstract class UserServiceManager {
 
         String className = Objects.requireNonNull(componentName.getClassName(), "class is null");
         String tag = options.getString(USER_SERVICE_ARG_TAG);
-        String key = packageName + ":" + (tag != null ? tag : className);
+        String key = buildRecordKey(userId, packageName, tag != null ? tag : className);
 
         // API < 13.1.4 will not send USER_SERVICE_ARG_REMOVE, true by default
         boolean remove = true;
@@ -86,6 +96,7 @@ public abstract class UserServiceManager {
             if (remove) {
                 if (record.service == null) {
                     record.pendingDestroy = true;
+                    removeUserServiceLocked(record);
                 } else {
                     removeUserServiceLocked(record);
                 }
@@ -98,6 +109,18 @@ public abstract class UserServiceManager {
 
     private void removeUserServiceLocked(UserServiceRecord record) {
         if (userServiceRecords.values().remove(record)) {
+            // Also prune packageUserServiceRecords to prevent memory leaks (from Nightzuku & Porter API)
+            synchronized (packageUserServiceRecords) {
+                Iterator<Map.Entry<String, List<UserServiceRecord>>> it = packageUserServiceRecords.entrySet().iterator();
+                while (it.hasNext()) {
+                    Map.Entry<String, List<UserServiceRecord>> entry = it.next();
+                    List<UserServiceRecord> list = entry.getValue();
+                    list.remove(record);
+                    if (list.isEmpty()) {
+                        it.remove();
+                    }
+                }
+            }
             record.destroy();
             onUserServiceRecordRemoved(record);
         }
@@ -106,6 +129,7 @@ public abstract class UserServiceManager {
     public int addUserService(IShizukuServiceConnection conn, Bundle options, int callingApiVersion) {
         Objects.requireNonNull(conn, "connection is null");
         Objects.requireNonNull(options, "options is null");
+        options.setClassLoader(ComponentName.class.getClassLoader());
 
         int uid = Binder.getCallingUid();
         int appId = UserHandleCompat.getAppId(uid);
@@ -116,16 +140,19 @@ public abstract class UserServiceManager {
         PackageInfo packageInfo = ensureCallingPackageForUserService(packageName, appId, userId);
 
         String className = Objects.requireNonNull(componentName.getClassName(), "class is null");
-        String sourceDir = Objects.requireNonNull(packageInfo.applicationInfo.sourceDir, "apk path is null");
+        Objects.requireNonNull(packageInfo.applicationInfo.sourceDir, "apk path is null");
 
         int versionCode = options.getInt(USER_SERVICE_ARG_VERSION_CODE, 1);
         String tag = options.getString(USER_SERVICE_ARG_TAG);
         String processNameSuffix = options.getString(USER_SERVICE_ARG_PROCESS_NAME);
+        if (processNameSuffix == null || processNameSuffix.isEmpty()) {
+            processNameSuffix = "user_service";
+        }
         boolean debug = options.getBoolean(USER_SERVICE_ARG_DEBUGGABLE, false);
         boolean noCreate = options.getBoolean(USER_SERVICE_ARG_NO_CREATE, false);
         boolean daemon = options.getBoolean(USER_SERVICE_ARG_DAEMON, true);
         boolean use32Bits = options.getBoolean(USER_SERVICE_ARG_USE_32_BIT_APP_PROCESS, false);
-        String key = packageName + ":" + (tag != null ? tag : className);
+        String key = buildRecordKey(userId, packageName, tag != null ? tag : className);
 
         synchronized (this) {
             UserServiceRecord record = getUserServiceRecordLocked(key);
@@ -158,7 +185,10 @@ public abstract class UserServiceManager {
                 } else if (!newRecord.starting) {
                     newRecord.setStartingTimeout(DateUtils.SECOND_IN_MILLIS * 30);
 
-                    Runnable runnable = () -> startUserService(newRecord, key, newRecord.token, packageName, className, processNameSuffix, uid, use32Bits, debug);
+                    final String finalProcessSuffix = processNameSuffix;
+                    Runnable runnable = () -> startUserService(
+                            newRecord, key, newRecord.token, packageName, className,
+                            finalProcessSuffix, uid, use32Bits, debug);
                     newRecord.spawnRunnable = runnable;
                     executor.execute(runnable);
                     return 0;
@@ -222,19 +252,28 @@ public abstract class UserServiceManager {
             UserServiceRecord record, String key, String token, String packageName,
             String classname, String processNameSuffix, int callingUid, boolean use32Bits, boolean debug) {
 
+        if (record.removed || record.pendingDestroy) {
+            LOGGER.v("Service record %s (%s) was removed before it could start", key, token);
+            return;
+        }
+
         LOGGER.v("Starting process for service record %s (%s)...", key, token);
 
         String cmd = getUserServiceStartCmd(record, key, token, packageName, classname, processNameSuffix, callingUid, use32Bits && AbiUtil.has32Bit(), debug);
         int exitCode;
+        java.lang.Process process = null;
         try {
-            java.lang.Process process = Runtime.getRuntime().exec("sh");
-            OutputStream os = process.getOutputStream();
-            os.write(cmd.getBytes());
-            os.flush();
-            os.close();
+            process = Runtime.getRuntime().exec("sh");
+            try (OutputStream os = process.getOutputStream()) {
+                os.write(cmd.getBytes(StandardCharsets.UTF_8));
+                os.flush();
+            }
 
             exitCode = process.waitFor();
         } catch (Throwable e) {
+            if (process != null) {
+                process.destroy();
+            }
             LOGGER.w("Failed to start process for service record %s (%s): %s", key, token, e.getMessage());
             dropRecordIfNotAttachedLocked(record);
             return;
@@ -247,7 +286,7 @@ public abstract class UserServiceManager {
 
     private void dropRecordIfNotAttachedLocked(UserServiceRecord record) {
         synchronized (this) {
-            if (record.service != null) {
+            if (record.service != null || record.removed) {
                 return;
             }
             if (record.callbacks.getRegisteredCallbackCount() > 0
@@ -263,8 +302,6 @@ public abstract class UserServiceManager {
             removeUserServiceLocked(record);
         }
     }
-
-    private static final int MAX_SPAWN_RETRIES = 3;
 
     public abstract String getUserServiceStartCmd(
             UserServiceRecord record, String key, String token, String packageName,
@@ -295,10 +332,19 @@ public abstract class UserServiceManager {
         if (binder == null || !binder.pingBinder()) {
             return;
         }
+        String descriptor;
+        try {
+            descriptor = binder.getInterfaceDescriptor();
+        } catch (Throwable tr) {
+            descriptor = null;
+        }
+        if (descriptor == null) {
+            return;
+        }
         Parcel data = Parcel.obtain();
         Parcel reply = Parcel.obtain();
         try {
-            data.writeInterfaceToken(binder.getInterfaceDescriptor());
+            data.writeInterfaceToken(descriptor);
             binder.transact(ShizukuApiConstants.USER_SERVICE_TRANSACTION_destroy, data, reply, Binder.FLAG_ONEWAY);
         } catch (Throwable e) {
             LOGGER.w("Failed to destroy unknown/orphaned user service binder", e);
@@ -310,6 +356,8 @@ public abstract class UserServiceManager {
 
     public void attachUserService(IBinder binder, Bundle options) {
         Objects.requireNonNull(binder, "binder is null");
+        Objects.requireNonNull(options, "options is null");
+        options.setClassLoader(Bundle.class.getClassLoader());
         String token = Objects.requireNonNull(options.getString(ShizukuApiConstants.USER_SERVICE_ARG_TOKEN), "token is null");
 
         synchronized (this) {
@@ -318,22 +366,22 @@ public abstract class UserServiceManager {
     }
 
     public void onUserServiceRecordCreated(UserServiceRecord record, PackageInfo packageInfo) {
-
     }
 
     public void onUserServiceRecordRemoved(UserServiceRecord record) {
-
     }
 
     public void removeUserServicesForPackage(String packageName) {
-        List<UserServiceRecord> list = packageUserServiceRecords.get(packageName);
+        List<UserServiceRecord> list = packageUserServiceRecords.remove(packageName);
         if (list != null) {
-            for (UserServiceRecord record : list) {
+            List<UserServiceRecord> snapshot;
+            synchronized (list) {
+                snapshot = new ArrayList<>(list);
+            }
+            for (UserServiceRecord record : snapshot) {
                 record.removeSelf();
                 LOGGER.i("Remove user service %s for package %s", record.token, packageName);
             }
-            packageUserServiceRecords.remove(packageName);
         }
     }
-
 }

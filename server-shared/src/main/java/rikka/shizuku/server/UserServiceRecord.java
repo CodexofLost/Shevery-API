@@ -7,6 +7,8 @@ import android.os.IBinder;
 import android.os.Parcel;
 import android.os.RemoteCallbackList;
 
+import androidx.annotation.Nullable;
+
 import java.util.UUID;
 
 import moe.shizuku.server.IShizukuServiceConnection;
@@ -35,11 +37,14 @@ public abstract class UserServiceRecord {
     private final IBinder.DeathRecipient deathRecipient;
     public final int versionCode;
     public String token;
-    public IBinder service;
+    public volatile IBinder service;
+    @Nullable
+    private volatile String interfaceDescriptor;
     public final RemoteCallbackList<IShizukuServiceConnection> callbacks = new ConnectionList();
-    public boolean daemon;
-    public boolean starting;
-    public boolean pendingDestroy;
+    public volatile boolean daemon;
+    public volatile boolean starting;
+    public volatile boolean pendingDestroy;
+    public volatile boolean removed;
     public Runnable spawnRunnable;
     public int spawnAttempts;
 
@@ -63,12 +68,20 @@ public abstract class UserServiceRecord {
 
         starting = true;
         startTimeoutCallback = () -> {
-            if (starting) {
+            if (!removed && starting) {
                 LOGGER.w("Service record %s is not started in %d ms", token, timeoutMillis);
                 removeSelf();
             }
         };
         HandlerUtil.getMainHandler().postDelayed(startTimeoutCallback, timeoutMillis);
+    }
+
+    public void markRemoved() {
+        removed = true;
+        starting = false;
+        if (startTimeoutCallback != null) {
+            HandlerUtil.getMainHandler().removeCallbacks(startTimeoutCallback);
+        }
     }
 
     public void setDaemon(boolean daemon) {
@@ -78,9 +91,20 @@ public abstract class UserServiceRecord {
     public void setBinder(IBinder binder) {
         LOGGER.v("Binder received for service record %s", token);
 
-        HandlerUtil.getMainHandler().removeCallbacks(startTimeoutCallback);
-
+        if (startTimeoutCallback != null) {
+            HandlerUtil.getMainHandler().removeCallbacks(startTimeoutCallback);
+        }
+        starting = false;
         service = binder;
+
+        // Cache descriptor once upon attach so destroy() never blocks on a synchronous
+        // getInterfaceDescriptor() round-trip or passes null to writeInterfaceToken().
+        // Adapted from Porter API (UserServiceRecord.kt).
+        try {
+            interfaceDescriptor = binder.getInterfaceDescriptor();
+        } catch (Throwable tr) {
+            interfaceDescriptor = null;
+        }
 
         try {
             binder.linkToDeath(deathRecipient, 0);
@@ -88,7 +112,7 @@ public abstract class UserServiceRecord {
             LOGGER.w("linkToDeath %s", token);
         }
 
-        if (pendingDestroy) {
+        if (pendingDestroy || removed) {
             LOGGER.v("Service record %s attached after an unbind requested its removal - removing", token);
             removeSelf();
             return;
@@ -134,24 +158,46 @@ public abstract class UserServiceRecord {
     public abstract void removeSelf();
 
     public void destroy() {
-        if (service != null) {
-            service.unlinkToDeath(deathRecipient, 0);
-        }
-
-        if (service != null && service.pingBinder()) {
-            Parcel data = Parcel.obtain();
-            Parcel reply = Parcel.obtain();
-            try {
-                data.writeInterfaceToken(service.getInterfaceDescriptor());
-                service.transact(USER_SERVICE_TRANSACTION_destroy, data, reply, Binder.FLAG_ONEWAY);
-            } catch (Throwable e) {
-                LOGGER.w("Failed to call destroy %s", token);
-            } finally {
-                data.recycle();
-                reply.recycle();
+        markRemoved();
+        try {
+            IBinder activeService = service;
+            if (activeService != null) {
+                try {
+                    activeService.unlinkToDeath(deathRecipient, 0);
+                } catch (Throwable ignored) {
+                }
             }
-        }
 
-        callbacks.kill();
+            if (activeService != null && activeService.pingBinder()) {
+                String descriptor = interfaceDescriptor;
+                if (descriptor == null) {
+                    try {
+                        descriptor = activeService.getInterfaceDescriptor();
+                    } catch (Throwable ignored) {
+                    }
+                }
+                if (descriptor != null) {
+                    Parcel data = Parcel.obtain();
+                    Parcel reply = Parcel.obtain();
+                    try {
+                        data.writeInterfaceToken(descriptor);
+                        activeService.transact(USER_SERVICE_TRANSACTION_destroy, data, reply, Binder.FLAG_ONEWAY);
+                    } catch (Throwable e) {
+                        LOGGER.w("Failed to call destroy %s", token);
+                    } finally {
+                        data.recycle();
+                        reply.recycle();
+                    }
+                } else {
+                    // Parcel.writeInterfaceToken(null) triggers a JNI abort; skip safely (from Porter API)
+                    LOGGER.w("No interface descriptor for service record %s, skipping destroy transaction", token);
+                }
+            } else if (activeService == null) {
+                // Notify waiting callers when a starting record fails or times out before attaching (from Porter API)
+                broadcastBinderDied();
+            }
+        } finally {
+            callbacks.kill();
+        }
     }
 }
